@@ -61,6 +61,9 @@ export function easeAt(curve, u) {
   return bez(y1, y2, paramAt(x1, x2, u));
 }
 
+// 图层导出页嵌入同一份缓动实现，保持预览与出片一致。
+export const KEYFRAME_CURVE_SOURCE = `const bez=${bez.toString()};${paramAt.toString()};${easeAt.toString()};`;
+
 /**
  * 在时间 u 处把一段曲线切成两段，各自归一回 0–1 的框（de Casteljau）。哪一半前后的值一样就回 null（那一半是平的）。
  * ponytail: 极端的自定义曲线切出来的控制柄横坐标可能出框，夹回 0–1，形状差一点；要精确就得存不归一的控制柄。

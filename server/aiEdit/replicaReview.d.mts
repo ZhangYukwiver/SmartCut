@@ -1,7 +1,7 @@
 import type { DrawingLayer } from './drawing.mjs';
 export interface ReplicaReviewLayer {
   name: string; start: number; duration: number; drawing: DrawingLayer; extraction?: number; fit?: 'cover' | 'contain' | 'stretch';
-  keyframes?: { property: string; offset: number; value: number }[];
+  keyframes?: { property: string; offset: number; value: number; curve?: number[] }[];
   transform?: Record<string, number | boolean> | null;
   media?: { url: string; kind: 'image' | 'video'; start: number; speed: number; fit: string };
 }

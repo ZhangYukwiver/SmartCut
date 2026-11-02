@@ -28,13 +28,20 @@ const runtimeDependencyRoots = new Set([
   "lodash.isequal",
   "semver",
   "tiny-typed-emitter",
+  "onnxruntime-node",
+  "onnxruntime-common",
+  "sharp",
+  "@img",
+  "detect-libc",
 ]);
-// 打包时要和源码逐字节一致的文件：服务入口、桌面外壳、运行时要读的数据和两份第三方许可证
+// 打包时要和源码逐字节一致的文件：服务入口、桌面外壳、运行时要读的数据和第三方许可证
 const sourceFiles = [
   "server/server.mjs", "server/analysisRoutes.mjs", "server/videoAnalysis.mjs", "server/localAi.mjs", "server/systemProxy.mjs",
   "server/aiEdit/index.mjs", "server/aiEdit/tools.mjs", "server/aiEdit/catalog.json", "server/aiEdit/probe-video.mp4",
+  "server/aiEdit/cutout.mjs", "server/aiEdit/cutoutWorker.mjs", "server/aiEdit/imageRefine.mjs", "server/aiEdit/imageRefineWorker.mjs",
   "server/aiEdit/draftTemplates/draft_content_template.json",
   "server/licenses/openfilm-LICENSE.txt", "server/licenses/pyJianYingDraft-Apache-2.0.txt",
+  "server/licenses/BiRefNet-MIT.txt", "server/licenses/LaMa-Apache-2.0.txt",
   "desktop/main.mjs", "desktop/preload.cjs", "desktop/inbox.mjs", "desktop/migrate.mjs", "desktop/filmWindow.mjs", "desktop/staticServer.mjs",
 ];
 const extractFile = (archive, relative) => extractArchiveFile(archive, path.normalize(relative));

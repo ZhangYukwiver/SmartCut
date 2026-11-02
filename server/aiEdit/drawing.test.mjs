@@ -1,8 +1,11 @@
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
+import { runInNewContext } from 'node:vm';
 import { afterEach, describe, expect, it } from 'vitest';
-import { drawingProblem, drawingTimes, drawingTransform } from './drawing.mjs';
+import { drawingPage, drawingProblem, drawingTimes, drawingTransform } from './drawing.mjs';
+import { easeAt, KEYFRAME_CURVES } from './curves.mjs';
+import { refinementLayers } from './refine.mjs';
 import { ProjectStore } from './projectStore.mjs';
 import { createToolRunner } from './tools.mjs';
 import { projectToFilm } from './film/filmFile.mjs';
@@ -24,6 +27,24 @@ async function setup() {
   return { store, options, project: p, segment: p.tracks[0].segments[0] };
 }
 describe('editable drawing layers', () => {
+  it('preserves keyframe easing in calibration and the standalone exported page', () => {
+    const curve = KEYFRAME_CURVES.ease_out.curve;
+    const segment = { drawing, timeline: { start_us: 0, duration_us: 1e6 }, keyframes: [
+      { property: 'transform_x', offset_us: 0, value: 0, curve },
+      { property: 'transform_x', offset_us: 1e6, value: .4 },
+    ] };
+    const expected = .4 * easeAt(curve, .5);
+    expect(expected).toBeGreaterThan(.3);
+    expect(drawingTransform(segment, 500000).transform_x).toBeCloseTo(expected);
+    const reviewed = refinementLayers({ tracks: [{ track_type: 'video', segments: [segment] }] }, {}, { origin: 0, duration: 1 });
+    expect(reviewed[0].keyframes[0].curve).toEqual(curve);
+    const html = drawingPage(segment, { width: 480, height: 270 });
+    const script = html.match(/<script>([\s\S]*)<\/script>/u)[1];
+    const exported = runInNewContext(`${script}\ntransform(segment, 500000)`, {
+      document: { querySelector: () => ({ getContext: () => ({}) }) }, window: {},
+    });
+    expect(exported.transform_x).toBeCloseTo(expected);
+  });
   it('writes AAC priming and tail padding as a presentation edit, preserving beat alignment', async () => {
     const root = await mkdtemp(path.join(tmpdir(), 'audio-priming-')); roots.push(root);
     const file = path.join(root, 'a.mp4'), movie = await openMovie(file);

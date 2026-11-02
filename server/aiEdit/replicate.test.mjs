@@ -414,6 +414,9 @@ describe('automatic refinement of an existing timeline', () => {
     const legacy = structuredClone(t.before);
     legacy.tracks.forEach(t => t.segments.forEach(s => { if (s.drawing) delete s.drawing.referenceStart; }));
     expect(refinementTarget(legacy, t.library).origin).toBe(0);
+    const curved = structuredClone(legacy);
+    curved.tracks[0].segments[0].curve_speed = { name: '自定义', points: [{ x: 0, y: 1 }, { x: 1, y: 2 }] };
+    expect(() => refinementTarget(curved, t.library)).toThrow('曲线变速');
     legacy.tracks.push({ track_type: 'text', mute: false, segments: [{ timeline: { start_us: 0, duration_us: 1_000_000 } }] });
     expect(() => refinementTarget(legacy, t.library)).toThrow('暂不支持自动对照');
   });

@@ -1,3 +1,5 @@
+import { easeAt, KEYFRAME_CURVE_SOURCE } from './curves.mjs';
+
 // 可编辑的图层绘制数据。预览和出片使用同一份 Canvas 实现；工程只保存数据，不保存可执行脚本。
 export function drawingProblem(d) {
   if (!d || typeof d !== 'object' || Array.isArray(d)) return '动画参数应为对象';
@@ -182,29 +184,35 @@ export function createDrawingRenderer(canvas) {
   };
 }
 
-/** 同预览的线性关键帧（用于导出页面）。 */
-export function drawingTransform(segment, offset) {
-  const base = { scale_x: 1, scale_y: 1, transform_x: 0, transform_y: 0, rotation: 0, alpha: 1, ...segment.transform };
-  const properties = new Set((segment.keyframes ?? []).map(k => k.property));
-  for (const property of properties) {
-    const points = segment.keyframes.filter(k => k.property === property).sort((a, b) => a.offset_us - b.offset_us);
-    let value = points.at(-1).value;
-    if (offset <= points[0].offset_us) value = points[0].value;
-    else for (let i = 1; i < points.length; i++) if (offset <= points[i].offset_us) {
-      const a = points[i - 1], b = points[i]; value = a.value + (b.value - a.value) * (offset - a.offset_us) / (b.offset_us - a.offset_us); break;
+// 显式注入缓动算法，导出页面不依赖模块加载器的变量名。
+function createDrawingTransform(easing) {
+  return function drawingTransform(segment, offset) {
+    const base = { scale_x: 1, scale_y: 1, transform_x: 0, transform_y: 0, rotation: 0, alpha: 1, ...segment.transform };
+    const properties = new Set((segment.keyframes ?? []).map(k => k.property));
+    for (const property of properties) {
+      const points = segment.keyframes.filter(k => k.property === property).sort((a, b) => a.offset_us - b.offset_us);
+      let value = points.at(-1).value;
+      if (offset <= points[0].offset_us) value = points[0].value;
+      else for (let i = 1; i < points.length; i++) if (offset <= points[i].offset_us) {
+        const a = points[i - 1], b = points[i]; value = a.value + (b.value - a.value) * easing(a.curve, (offset - a.offset_us) / (b.offset_us - a.offset_us)); break;
+      }
+      base[property] = value;
     }
-    base[property] = value;
-  }
-  if (properties.has('uniform_scale')) base.scale_x = base.scale_y = base.uniform_scale;
-  return base;
+    if (properties.has('uniform_scale')) base.scale_x = base.scale_y = base.uniform_scale;
+    return base;
+  };
 }
+
+/** 与预览一致的关键帧及缓动曲线（用于校准和导出页面）。 */
+export const drawingTransform = createDrawingTransform(easeAt);
 
 /** 与其他文字页面一样作为 film.html 的透明图层，独立的素材地址相对这个页面。 */
 export function drawingPage(segment, stage, sourceUrl = null) {
   const json = value => JSON.stringify(value).replace(/</g, '\\u003c');
   return `<!doctype html><html><meta charset="utf-8"><style>html,body{margin:0;overflow:hidden;background:transparent}canvas{position:absolute;inset:0;width:100%;height:100%}</style><canvas width="${stage.width}" height="${stage.height}"></canvas><script>
 const segment=${json(segment)},src=${json(sourceUrl)},canvas=document.querySelector('canvas');
-const draw=(${createDrawingRenderer.toString()})(canvas),transform=${drawingTransform.toString()};
+${KEYFRAME_CURVE_SOURCE}
+const draw=(${createDrawingRenderer.toString()})(canvas),transform=(${createDrawingTransform.toString()})(easeAt);
 let media=null;
 const ready=src&&segment.drawing.content==='media'?new Promise((resolve,reject)=>{media=document.createElement(segment.kind==='video'?'video':'img');media.crossOrigin='anonymous';media.muted=true;media.preload='auto';media.addEventListener(segment.kind==='video'?'loadeddata':'load',resolve,{once:true});media.addEventListener('error',()=>reject(new Error('替换素材加载失败')),{once:true});media.src=src;}):Promise.resolve();
 window.film={width:${stage.width},height:${stage.height},duration:segment.timeline.duration_us/1e6,async frame(t){
