@@ -14,6 +14,33 @@ export const ENCODER_PAGE = `<!doctype html><meta charset="utf-8"><title>encoder
 ${MASTER_SOURCE}
 const b64 = (bytes) => new Promise((done) => { const reader = new FileReader(); reader.onload = () => done(String(reader.result).slice(String(reader.result).indexOf(',') + 1)); reader.readAsDataURL(new Blob([bytes])); });
 const bytesOf = async (chunk) => { const data = new Uint8Array(chunk.byteLength); chunk.copyTo(data); return b64(data); };
+// 某些系统 AAC 编码器把预滚样本也标为 timestamp=0。用独立脉冲测同一编码配置的延迟，不把测试声音写进成片。
+async function aacPriming(settings) {
+  if (typeof AudioDecoder === 'undefined') return 0;
+  const rate = settings.sampleRate, length = 14400, impulse = 2400;
+  const chunks = []; let configuration, failure;
+  const encoder = new AudioEncoder({ output(c, m) { chunks.push(c); if (m?.decoderConfig) configuration = m.decoderConfig; }, error(e) { failure = e; } });
+  try {
+    encoder.configure(settings);
+    for (let start = 0; start < length; start += 4800) {
+      const planes = new Float32Array(9600);
+      if (impulse >= start && impulse < start + 4800) planes[impulse - start] = planes[4800 + impulse - start] = .8;
+      const data = new AudioData({ format: 'f32-planar', sampleRate: rate, numberOfFrames: 4800, numberOfChannels: 2, timestamp: Math.round(start * 1e6 / rate), data: planes });
+      encoder.encode(data); data.close();
+    }
+    await encoder.flush(); if (failure) throw failure;
+  } finally { encoder.close(); }
+  let samples = 0, peak = 0, index = 0;
+  const decoder = new AudioDecoder({ output(frame) {
+    const pcm = new Float32Array(frame.numberOfFrames); frame.copyTo(pcm, { planeIndex: 0, format: 'f32-planar' });
+    for (let i = 0; i < pcm.length; i++) if (Math.abs(pcm[i]) > peak) { peak = Math.abs(pcm[i]); index = samples + i; }
+    samples += pcm.length; frame.close();
+  }, error(e) { failure = e; } });
+  try { decoder.configure(configuration); for (const chunk of chunks) decoder.decode(chunk); await decoder.flush(); if (failure) throw failure; }
+  finally { decoder.close(); }
+  const delay = index - impulse;
+  return peak > .05 && delay >= 0 && delay <= rate / 10 ? delay : 0;
+}
 let video = null, out = [], config = null, failure = null, fps = 30, W = 0, H = 0;
 window.enc = {
   async start({ width, height, fps: rate, bitrate }) {
@@ -105,7 +132,10 @@ window.enc = {
     await encoder.flush();
     encoder.close();
     if (broken) throw broken;
-    return { sampleRate: rate, channels: 2, bitrate: 192000, description: described ? await b64(described) : null, skipped: [...skipped], master,
+    // AAC 编码器可能先输出负时间戳的预滚样本（macOS 上常见 2112 样本）。封装时通过 edit list 跳过，不能当作 t=0 的声音。
+    const primingSamples = chunks[0]?.timestamp < 0 ? Math.round(-chunks[0].timestamp * rate / 1e6) : await aacPriming(settings).catch(() => 0);
+    return { sampleRate: rate, channels: 2, bitrate: 192000, primingSamples, presentationSamples: length,
+      description: described ? await b64(described) : null, skipped: [...skipped], master,
       chunks: await Promise.all(chunks.map(async (c) => ({ data: await bytesOf(c), samples: Math.round((c.duration ?? 21333) * rate / 1e6) }))) };
   },
 };

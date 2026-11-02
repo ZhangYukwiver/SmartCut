@@ -74,8 +74,8 @@ let finished = false;
 const finish = (code = 0) => {
   if (finished) return;
   finished = true;
-  if (role === "claude") print({ type: "result", subtype: "success", is_error: false, result: "", session_id: "s" });
-  else print({ type: "turn.completed", usage: {} });
+  if (role === "claude") print({ type: "result", subtype: "success", is_error: false, result: "", session_id: "s", usage: plan.usage });
+  else print({ type: "turn.completed", usage: plan.usage ?? {} });
   save();
   process.exit(code);
 };

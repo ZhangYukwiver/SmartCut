@@ -4,6 +4,7 @@ import { stat } from "node:fs/promises";
 import { pipeline } from "node:stream/promises";
 
 import { AiEditError } from "./library.mjs";
+import { MAX_REVIEW_FRAMES } from './replicaTiming.mjs';
 
 // 看不了视频的模型怎么「看」参考视频：本机服务不带解码器（也不打包 ffmpeg），由开着的应用页面在浏览器里
 // 把视频拆成镜头截图、闪白位置和音乐节拍交回来，再由本机服务把截图和数字交给模型。这里管三件事：
@@ -39,12 +40,58 @@ function times(list, max) {
 /** 页面交回来的结果：信任边界，逐项核对、限量，不认识的字段丢掉。 */
 export function parseLookResult(body, kind) {
   if (typeof body?.error === "string" && body.error.trim()) return { error: body.error.trim().slice(0, 300) };
-  const duration = seconds(body?.duration, 6 * 3600);
+  const duration = ['replica', 'replica-review', 'replica-measure'].includes(kind) && typeof body?.duration === 'number' && Number.isFinite(body.duration) && body.duration > 0 && body.duration <= 6 * 3600
+    ? Math.round(body.duration * 1e6) / 1e6 : seconds(body?.duration, 6 * 3600);
   if (!duration) throw new AiEditError("look_invalid", "页面交回的视频信息不完整。", 422);
+  if (kind === 'replica-measure') {
+    if (!Array.isArray(body.layers) || body.layers.length < 2 || body.layers.length > 64 || JSON.stringify(body.layers).length > 600_000
+      || !Number.isInteger(body.measured) || body.measured < 0 || body.measured > 64) throw new AiEditError('look_invalid', '参考轮廓测量结果无效。', 422);
+    // drawing 和时间参数由复刻计划解析器再作完整校验，校验前不会写入工程。
+    return { duration, layers: body.layers, measured: body.measured };
+  }
+  if (kind === 'replica-review') {
+    const score = n => typeof n === 'number' && Number.isFinite(n) && n >= 0 && n <= 1;
+    const validSheet = (s, count = 4) => typeof s?.image === 'string' && s.image.length <= 3_000_000 && FRAME_URL.test(s.image)
+      && Array.isArray(s.times) && s.times.length > 0 && s.times.length <= count && s.times.every(t => seconds(t, duration) !== null);
+    if (body.coverage !== 'all-frames' || !score(body.meanError) || !score(body.worstError) || !score(body.localError) || !score(body.temporalError)
+      || !Number.isInteger(body.renderFps) || body.renderFps < 1 || body.renderFps > 120
+      || !Number.isInteger(body.requiredFps) || body.requiredFps < 1 || body.requiredFps > 1_000_000
+      || !Array.isArray(body.samples) || !body.samples.length || body.samples.length > MAX_REVIEW_FRAMES || body.frameCount !== body.samples.length
+      || !body.samples.every((s, i) => s?.frame === i && seconds(s.t, duration) !== null && (!i || s.t > body.samples[i - 1].t)
+        && typeof s.duration === 'number' && s.duration > 0 && s.t + s.duration <= duration + .00001
+        && (i + 1 === body.samples.length ? Math.abs(s.t + s.duration - duration) < .00001 : Math.abs(s.t + s.duration - body.samples[i + 1].t) < .00001)
+        && typeof s.renderedAt === 'number' && Number.isFinite(s.renderedAt) && score(s.error) && score(s.localError) && score(s.temporalError))
+      || !Array.isArray(body.sheets) || !body.sheets.length || body.sheets.length > 4
+      || !body.sheets.every(s => validSheet(s))
+      || !Array.isArray(body.detailSheets) || body.detailSheets.length > 2 || !body.detailSheets.every(s => validSheet(s))
+      || !Array.isArray(body.temporalSheets) || body.temporalSheets.length > 8 || !body.temporalSheets.every(s => validSheet(s, 5)
+        && Array.isArray(s.frames) && s.frames.length === s.times.length && s.frames.includes(s.peakFrame)
+        && s.frames.every((f, i) => Number.isInteger(f) && f >= 0 && f < body.samples.length && (!i || f === s.frames[i - 1] + 1) && Math.abs(body.samples[f].t - s.times[i]) < .000001))) {
+      throw new AiEditError('look_invalid', '参考画面对照结果无效。', 422);
+    }
+    const sheet = s => ({ times: s.times, image: s.image });
+    return { duration, coverage: 'all-frames', frameCount: body.frameCount, renderFps: body.renderFps, requiredFps: body.requiredFps,
+      meanError: body.meanError, localError: body.localError, temporalError: body.temporalError, worstError: body.worstError,
+      samples: body.samples.map(s => ({ frame: s.frame, t: s.t, duration: s.duration, renderedAt: s.renderedAt, error: s.error, localError: s.localError, temporalError: s.temporalError })),
+      sheets: body.sheets.map(sheet), detailSheets: body.detailSheets.map(sheet),
+      regionMeasurements: Array.isArray(body.regionMeasurements) ? body.regionMeasurements.slice(0, 100).filter(m => m && Number.isInteger(m.layer) && Number.isInteger(m.step) && (Number.isInteger(m.polygon_index) || (m.polygon_index === null && Number.isInteger(m.trackedFromStep)))
+        && seconds(m.t, duration) !== null && typeof m.localTime === 'number' && Number.isFinite(m.localTime)
+        && Array.isArray(m.reference?.bounds) && m.reference.bounds.length === 4 && m.reference.bounds.every(v => typeof v === 'number' && v >= 0 && v <= 1)
+        && /^#[\da-f]{6}$/iu.test(m.reference?.color)) : [],
+      temporalSheets: body.temporalSheets.map(s => ({ ...sheet(s), frames: s.frames, peakFrame: s.peakFrame })),
+      windows: body.temporalSheets.map(s => ({ start: s.frames[0], end: s.frames.at(-1), peak: s.peakFrame, error: body.samples[s.peakFrame].temporalError })) };
+  }
   if (kind === "squeeze") {
     const video = typeof body.video === "string" ? Buffer.from(body.video, "base64") : null;
     if (video?.toString("latin1", 4, 8) !== "ftyp") throw new AiEditError("look_invalid", "页面交回的压缩视频不是 mp4。", 422);
     return { duration, video, audio: body.audio === true };
+  }
+  if (kind === 'extract') {
+    const assets = Array.isArray(body.assets) && body.assets.length <= 32 ? body.assets : null;
+    if (!assets || !assets.every(a => typeof a === 'string' && a.length <= 1_500_000 && FRAME_URL.test(a))) throw new AiEditError('look_invalid', '参考素材截图无效。', 422);
+    const wav = typeof body.wav === 'string' && body.wav.length <= 64 * 1024 * 1024 ? Buffer.from(body.wav, 'base64') : null;
+    if (body.wav && (!wav || wav.toString('ascii', 0, 4) !== 'RIFF' || wav.toString('ascii', 8, 12) !== 'WAVE')) throw new AiEditError('look_invalid', '参考原声无效。', 422);
+    return { duration, assets, wav };
   }
   const beats = body.beats && typeof body.beats === "object" ? {
     bpm: typeof body.beats.bpm === "number" && body.beats.bpm >= 30 && body.beats.bpm <= 300 ? Math.round(body.beats.bpm * 10) / 10 : null,
@@ -67,8 +114,18 @@ export function parseLookResult(body, kind) {
     const keep = new Set(Array.from({ length: MAX_FRAMES }, (_, index) => framed[Math.floor((index * framed.length) / MAX_FRAMES)]));
     for (const shot of shots) if (shot.frame && !keep.has(shot)) shot.frame = null;
   }
+  let motion = {};
+  if (kind === 'replica') {
+    const sheets = Array.isArray(body.sheets) ? body.sheets : [];
+    if (!(typeof body.sampleStep === 'number' && Number.isFinite(body.sampleStep) && body.sampleStep > 0 && body.sampleStep <= duration) || !sheets.length || sheets.length > 40 || !sheets.every(s => s && typeof s.image === 'string' && s.image.length <= 1_500_000 && FRAME_URL.test(s.image)
+      && Array.isArray(s.times) && s.times.length > 0 && s.times.length <= 4 && s.times.every(t => typeof t === 'number' && Number.isFinite(t) && t >= 0 && t <= duration + .02))) {
+      throw new AiEditError('look_invalid', '动画逐帧材料无效。', 422);
+    }
+    motion = { sheets, sampleStep: body.sampleStep };
+  }
   return {
     ...result,
+    ...motion,
     width: Number.isInteger(body.width) && body.width > 0 ? body.width : null,
     height: Number.isInteger(body.height) && body.height > 0 ? body.height : null,
     shots,
@@ -134,7 +191,7 @@ export function createLookDesk({ filePath = "/v1/ai-edit/look", texts = AI_EDIT_
      * 把活儿挂到 holder 上，页面轮询看到后在浏览器里做完交回。
      * kind：reference（镜头、截图、闪白、节拍）、beats（只要节拍）或 squeeze（重新编一份不超过 bytes 的 mp4）。
      */
-    ask(holder, { kind, url, name, bytes }, { signal } = {}) {
+    ask(holder, { kind, url, name, bytes, crops, audio, layers, canvas, origin }, { signal } = {}) {
       if (holder.live && !holder.live()) return Promise.reject(new AiEditError("look_unavailable", texts.unavailable, 409));
       const id = randomBytes(8).toString("hex");
       const mine = () => holder.get()?.id === id;
@@ -186,7 +243,7 @@ export function createLookDesk({ filePath = "/v1/ai-edit/look", texts = AI_EDIT_
         jobs.set(id, job);
         if (signal?.aborted) { job.abort(); return; }
         signal?.addEventListener("abort", job.abort, { once: true });
-        holder.set({ id, kind, url, ...(name ? { name: String(name).slice(0, 80) } : {}), ...(bytes ? { bytes } : {}) });
+        holder.set({ id, kind, url, ...(name ? { name: String(name).slice(0, 80) } : {}), ...(bytes ? { bytes } : {}), ...(crops ? { crops } : {}), ...(audio ? { audio: true } : {}), ...(layers ? { layers } : {}), ...(canvas ? { canvas } : {}), ...(origin !== undefined ? { origin } : {}) });
         holder.touch();
       });
     },

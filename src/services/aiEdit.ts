@@ -1,5 +1,6 @@
 import { ServerError, serverFetch, normalizeServerBaseUrl, type Connection } from "./connection";
 import type { AiEditCommandAsk } from "./aiEditSkills";
+import type { DrawingLayer } from "../../server/aiEdit/drawing.mjs";
 
 // AI 剪辑：对话、工程、素材库都在本机服务（server/aiEdit/），页面只负责发消息、长轮询会话、上传素材和展示。
 // 接口配置存在本机 localStorage，每次随消息带过去，服务不保存 Key。剪辑模型单独存；看视频用的「解析视频」服务就是解析库那份配置。
@@ -18,6 +19,7 @@ export interface AiEditConfig {
   localModels?: Partial<Record<LocalAiRuntime, string>>;
   /** 保存时测过：模型能不能直接看视频（看不了的话，参考视频改由页面拆成截图和节拍再给它看）；没测过是 null */
   videoInput?: boolean | null;
+  imageInput?: boolean | null;
   /** 测的是哪个接口地址和模型，换了就要重测 */
   videoProbe?: string;
 }
@@ -43,7 +45,7 @@ export const aiConfigReady = (config: Pick<AiEditConfig, "runtime" | "baseUrl" |
 
 /** 剪辑模型存进去的样子：测视频的结果交给外面按地址和模型决定沿不沿用，字段去掉首尾空格。 */
 export function tidyAiEditConfig(draft: AiEditConfig): AiEditConfig {
-  const { videoInput: _input, videoProbe: _probe, localModels, ...rest } = draft;
+  const { videoInput: _input, imageInput: _image, videoProbe: _probe, localModels, ...rest } = draft;
   const models = localModels ? Object.fromEntries(Object.entries(localModels).map(([key, model]) => [key, (model ?? "").trim()])) : undefined;
   return { ...rest, runtime: aiRuntimeOf(draft.runtime), apiKey: draft.apiKey.trim(), model: draft.model.trim(), baseUrl: draft.baseUrl.trim(), ...(models ? { localModels: models } : {}) };
 }
@@ -80,6 +82,7 @@ export function loadAiEditConfig(): AiEditConfig {
     if (localModels) config.localModels = localModels;
     // 测的不是现在这个模型就当没测过
     if (typeof saved?.videoInput === "boolean" && saved.videoProbe === videoProbeKey(config)) Object.assign(config, { videoInput: saved.videoInput, videoProbe: saved.videoProbe });
+    if (typeof saved?.imageInput === "boolean" && saved.videoProbe === videoProbeKey(config)) config.imageInput = saved.imageInput;
     return config;
   } catch {
     return DEFAULT_AI_EDIT_CONFIG;
@@ -295,6 +298,8 @@ interface EditSegmentBase { id: string; timeline: EditTimeRange; keyframes?: Edi
 export interface EditAnimation { animation_type: string; duration_us?: number | null; phase?: "in" | "out" | "group" | "loop"; default_us?: number | null }
 
 export interface EditMediaSegment extends EditSegmentBase {
+  /** 图层的轮廓、光照和分块蒙版，预览与 MP4 共用绘制器。 */
+  drawing?: DrawingLayer | null;
   kind: "video" | "image" | "audio";
   path: string;
   source: EditTimeRange;
@@ -402,7 +407,7 @@ export interface AiEditSessionSummary {
   awaitingCommand?: boolean;
 }
 
-export interface AiEditAction { name: string; summary: string; ok: boolean; error?: string }
+export interface AiEditAction { name: string; summary: string; ok: boolean; error?: string; visionNote?: string; vision?: unknown; verification?: unknown }
 
 /** 在画面上框的一块：x/y/width/height 是相对画布的比例（0–1，从左上角量），clip_ids 是框里的片段。 */
 export interface AiEditRegion { time_us: number; x: number; y: number; width: number; height: number; clip_ids: string[] }
@@ -423,6 +428,8 @@ export interface AiEditChatItem {
   text: string;
   at: string;
   actions?: AiEditAction[];
+  /** 已完成或取消的视觉调用记录，不含 Key、请求头或模型内部推理。 */
+  visionCalls?: unknown[];
   /** 用户发这句时带的框选；labels 是框里片段的称呼 */
   region?: AiEditRegion & { labels?: string[] };
   /** 用户这句引用的片段、时刻、素材 */
@@ -439,7 +446,7 @@ export interface AiEditSession extends AiEditSessionSummary {
   messages: AiEditChatItem[];
   /** 正在进行的这一轮：已经吐出来的文字和已经做完的步骤；look 是要页面在浏览器里帮忙拆的视频，spend 是等用户点头的花钱生成 */
   /** generating：正在生成图片、视频（或运行技能命令）时的一句状态；command 是等用户点头的技能命令 */
-  streaming: { text: string; actions?: AiEditAction[]; look?: AiEditLookJob; spend?: AiEditSpendAsk; command?: AiEditCommandAsk; generating?: string } | null;
+  streaming: { text: string; actions?: AiEditAction[]; visionCalls?: unknown[]; look?: AiEditLookJob; spend?: AiEditSpendAsk; command?: AiEditCommandAsk; generating?: string } | null;
   /** 能撤销的上一步（最后一份存档的说法和种类）；没有时为 null */
   undo?: { label: string; kind: AiEditStepKind } | null;
   /** 能重做的那一步（刚撤销掉的）；没有时为 null */
@@ -464,7 +471,12 @@ export interface AiEditSessionState { session: AiEditSession; project: EditProje
  * 本机服务没有解码器，参考视频的镜头截图、闪白和配乐节拍由页面在浏览器里拆好交回；解析库的视频太大发不出去时也由页面压一份小的（squeeze，压到 bytes 以内）。
  * url 是本机服务上的路径，访问时带素材 key。
  */
-export interface AiEditLookJob { id: string; kind: "reference" | "beats" | "squeeze"; url: string; name?: string; bytes?: number; claimed?: boolean }
+export interface AiEditLookJob {
+  id: string; kind: "reference" | "beats" | "squeeze" | "replica" | "extract" | "replica-review" | "replica-measure"; url: string; name?: string; bytes?: number; claimed?: boolean;
+  crops?: { time: number; crop: [number, number, number, number] }[]; audio?: boolean;
+  layers?: import('../../server/aiEdit/replicaReview.mjs').ReplicaReviewLayer[];
+  canvas?: { width: number; height: number; fps?: number }; origin?: number;
+}
 
 /**
  * 生成视频要花钱，模型不能自己批准：AI 要生成时这一轮先停下，把要生成的东西挂在这里，
@@ -511,7 +523,7 @@ export interface AiEditMediaItem {
    */
   source: {
     type: "handoff" | "local" | "page" | "generated" | "skill" | (string & {}); skill?: string; url?: string; videoId?: string; title?: string; author?: string; cover?: string; page?: string; pageId?: string; transparent?: boolean; renderedAt?: number;
-    provider?: "openai" | "seedance"; model?: string; prompt?: string; key?: string;
+    provider?: "openai" | "seedance"; model?: string; prompt?: string; key?: string; mediaId?: string; baseId?: string; operation?: "repair" | "mask";
   };
 }
 
@@ -598,6 +610,8 @@ export async function deleteAiEditSession(connection: Connection, id: string): P
 
 /** 一句话随带的东西：画面上框的一块、引用的片段/时刻/素材、附的图；没有的不发 */
 export interface AiEditMessageExtras {
+  /** 自动校准按钮直接执行校准工具，仍使用会话的进度、停止和整轮撤销。 */
+  refine?: boolean;
   region?: AiEditRegion | null;
   refs?: readonly AiEditRefRequest[];
   attachments?: readonly AiEditAttachmentRequest[];
@@ -610,10 +624,11 @@ export interface AiEditMessageExtras {
 }
 
 export async function sendAiEditMessage(connection: Connection, id: string, text: string, config: AiEditConfig, extras: AiEditMessageExtras = {}): Promise<AiEditSession> {
-  const { region, refs, attachments, freeOnly, generation, analysis } = extras;
+  const { region, refs, attachments, freeOnly, generation, analysis, refine } = extras;
   // 本机 CLI 只带运行时和模型，存着的 Key 和地址不发
   const body = {
     text, config: aiRequestConfig(config),
+    ...(refine ? { refine: true } : {}),
     ...(analysis ? { analysis: aiRequestConfig(analysis) } : {}),
     ...(region ? { region } : {}),
     ...(refs?.length ? { refs } : {}),
@@ -630,6 +645,7 @@ export async function sendAiEditMessage(connection: Connection, id: string, text
  * delete_clip、duplicate_clip { clip_id, start, track_id? }、update_track { track_id, mute }、reorder_tracks（全部轨道的完整顺序）。
  */
 export type AiEditClipEdit = "move_clip" | "update_clip" | "split_clip" | "delete_clip" | "duplicate_clip" | "update_track" | "reorder_tracks" | "set_canvas"
+  | "add_keyframes" | "remove_keyframe"
   | "add_marker" | "remove_marker" | "add_subtitle_line"
   // 左栏「剪映素材」点了直接套上、属性卡里去掉
   | "add_transition" | "add_filter" | "add_effect" | "add_animation" | "add_mask" | "set_mix_mode" | "clear_clip_feature"
@@ -769,10 +785,62 @@ export async function deleteAiEditMedia(connection: Connection, id: string): Pro
   await request(connection, `/v1/ai-edit/media/${encodeURIComponent(id)}`, { method: "DELETE" });
 }
 
+export interface AiEditCutoutJob {
+  status: "running" | "ready" | "failed";
+  stage: string;
+  progress: number | null;
+  item: AiEditMediaItem | null;
+  error: string | null;
+}
+
+/** 先启动后台任务，再取进度，首次下载模型不占住一条长 HTTP 请求。 */
+export async function cutoutAiEditMedia(connection: Connection, id: string, onProgress: (job: AiEditCutoutJob) => void): Promise<AiEditMediaItem> {
+  const endpoint = `/v1/ai-edit/media/${encodeURIComponent(id)}/cutout`;
+  let job: AiEditCutoutJob = await request(connection, endpoint, { method: "POST" });
+  const deadline = Date.now() + 20 * 60_000;
+  for (;;) {
+    onProgress(job);
+    if (job.status === "ready" && job.item) return job.item;
+    if (job.status === "failed") throw new Error(job.error || "图片抠图失败，请重试。");
+    if (Date.now() > deadline) throw new Error("抠图等待时间较长，任务仍在本机运行，稍后再点一次查看结果。");
+    await new Promise(resolve => setTimeout(resolve, 800));
+    job = await request(connection, endpoint);
+  }
+}
+
+/** Canvas PNG 只发给本机服务；mask 的 alpha 表示需要修复的区域。 */
+export function imageEditBase64(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result).split(",")[1] ?? "");
+    reader.onerror = () => reject(new Error("读不出精修图片，请重试。"));
+    reader.readAsDataURL(blob);
+  });
+}
+
+export async function saveAiEditImage(connection: Connection, id: string, image: string, signal?: AbortSignal): Promise<AiEditMediaItem> {
+  return (await request(connection, `/v1/ai-edit/media/${encodeURIComponent(id)}/image-refine`, { method: "POST", body: JSON.stringify({ image }), timeoutMs: 120_000, signal })).item;
+}
+
+export async function repairAiEditImage(connection: Connection, id: string, image: string, mask: string, onProgress: (job: AiEditCutoutJob) => void, signal?: AbortSignal): Promise<AiEditMediaItem> {
+  const endpoint = `/v1/ai-edit/media/${encodeURIComponent(id)}/image-repair`;
+  let job: AiEditCutoutJob & { id: string } = await request(connection, endpoint, { method: "POST", body: JSON.stringify({ image, mask }), timeoutMs: 60_000, signal });
+  const jobId = job.id, deadline = Date.now() + 20 * 60_000;
+  for (;;) {
+    signal?.throwIfAborted();
+    onProgress(job);
+    if (job.status === "ready" && job.item) return job.item;
+    if (job.status === "failed") throw new Error(job.error || "图片修复失败，请重试。");
+    if (Date.now() > deadline) throw new Error("修复等待时间较长，任务仍在本机运行，完成后会加入素材库。");
+    await new Promise(resolve => setTimeout(resolve, 800));
+    job = await request(connection, `${endpoint}/${encodeURIComponent(jobId)}`, { signal });
+  }
+}
+
 /** 素材文件地址：不带 Bearer，靠素材库的 key，<video>/<img> 可以直接用（支持 Range）。 */
 /** 请页面拆视频时，本机服务给的是路径，这里补上根地址和素材 key。 */
 export function aiEditLookUrl(baseUrl: string, path: string, key: string): string {
-  return `${normalizeServerBaseUrl(baseUrl)}${path}?key=${encodeURIComponent(key)}`;
+  return `${normalizeServerBaseUrl(baseUrl)}${path}${path.includes('?') ? '&' : '?'}key=${encodeURIComponent(key)}`;
 }
 
 export function aiEditMediaUrl(baseUrl: string, id: string, key: string): string {

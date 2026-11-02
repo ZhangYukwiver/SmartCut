@@ -36,6 +36,32 @@ const HAS_ALPHA = `(async (data) => {
 
 export const isPageId = (value) => typeof value === "string" && PAGE_ID.test(value);
 
+function validateHtml(html) {
+  if (typeof html !== "string" || !html.trim()) throw new AiEditError("page_empty", "网页内容是空的。", 422);
+  if (Buffer.byteLength(html) > MAX_PAGE_BYTES) throw new AiEditError("page_too_large", "网页太大了（超过 400KB），图片别内嵌，精简一下。", 422);
+  if (!/window\.film\b|\bfilm\s*=/u.test(html)) throw new AiEditError("page_not_film", "网页里要定义 window.film = { duration, frame(t) { … } }。", 422);
+}
+
+/** 在内存中精确修改正式页；每个原文片段必须唯一，避免校准一处时误改其他图层。 */
+export function patchPageHtml(original, patches) {
+  if (typeof original !== 'string' || !Array.isArray(patches) || patches.length < 1 || patches.length > 24) {
+    throw new AiEditError('arguments_invalid', '局部预览需要已有 page_id 和 1–24 处 patches。', 422);
+  }
+  let html = original;
+  for (const [index, patch] of patches.entries()) {
+    if (!patch || typeof patch.find !== 'string' || !patch.find.length || typeof patch.replace !== 'string') {
+      throw new AiEditError('arguments_invalid', `第 ${index + 1} 处修改需要非空 find 和字符串 replace。`, 422);
+    }
+    const at = html.indexOf(patch.find);
+    if (at < 0 || html.indexOf(patch.find, at + 1) >= 0) {
+      throw new AiEditError('page_patch_mismatch', `第 ${index + 1} 处原文未找到或不唯一，请重新 read_page 并提供完整的唯一片段。`, 409);
+    }
+    html = html.slice(0, at) + patch.replace + html.slice(at + patch.find.length);
+    validateHtml(html);
+  }
+  return html;
+}
+
 const DIFF = `(async (a, b, alpha) => {
   const load = async (data) => createImageBitmap(await (await fetch('data:image/' + (alpha ? 'png' : 'jpeg') + ';base64,' + data)).blob(), { resizeWidth: 96, resizeHeight: 96 });
   const pixels = async (data) => { const c = new OffscreenCanvas(96, 96); const g = c.getContext('2d'); g.drawImage(await load(data), 0, 0); return g.getImageData(0, 0, 96, 96).data; };
@@ -61,7 +87,7 @@ export function createPages({ root, library, files, provider, getOrigin }) {
    * 把 rel（pages/ 下的相对路径）渲成素材。itemId 给了就是重渲同一个素材、原地换文件。回 { item, problems, duration }。
    * transparent："auto" 先抽三帧看有没有透明的地方，有就当带透明的（PNG MOV），没有编 H.264。
    */
-  const render = ({ rel, name, width, height, duration, fallback = null, transparent, fps = 30, itemId = null, pageId, onProgress, signal }) => serial(async () => {
+  const render = ({ rel, name, width, height, duration, fallback = null, transparent, fps = 30, itemId = null, pageId, reference, onProgress, signal }) => serial(async () => {
     if (!provider) throw new AiEditError("film_unavailable", "这个环境没有能渲染网页的浏览器。", 503);
     const origin = getOrigin();
     const url = files.urlFor(origin, `pages/${rel}`);
@@ -112,7 +138,7 @@ export function createPages({ root, library, files, provider, getOrigin }) {
       const item = await library.adopt(temp, {
         id: itemId, name, extension,
         // renderedAt：看板的 iframe 地址带上它，改写后的网页不吃缓存
-        source: { type: "page", page: rel, ...(pageId ? { pageId } : {}), transparent: Boolean(transparent), renderedAt: Date.now() },
+        source: { type: "page", page: rel, ...(pageId ? { pageId } : {}), ...(reference ? { reference } : {}), transparent: Boolean(transparent), renderedAt: Date.now() },
       });
       return { item, problems, duration: seconds };
     } catch (error) {
@@ -127,6 +153,65 @@ export function createPages({ root, library, files, provider, getOrigin }) {
   return {
     directory,
     render,
+
+    /** 直接按真实动画时钟截图，不编码、不入素材库，也不覆盖正式页面。 */
+    preview: ({ html, pageId = null, times, width, height, crop = [0, 0, 1, 1], transparent = false, signal }) => serial(async () => {
+      validateHtml(html);
+      if (pageId && !isPageId(pageId)) throw new AiEditError('page_not_found', '没有这个网页片段。', 404);
+      if (!Array.isArray(times) || !times.length || times.length > 8 || times.some((t, i) => !Number.isFinite(t) || t < 0 || (i && t <= times[i - 1]))) {
+        throw new AiEditError("arguments_invalid", "预览需要 1–8 个严格递增的动画秒数。", 422);
+      }
+      if (!Array.isArray(crop) || crop.length !== 4 || !crop.every(n => Number.isFinite(n) && n >= 0 && n <= 1) || crop[2] <= 0 || crop[3] <= 0 || crop[0] + crop[2] > 1 || crop[1] + crop[3] > 1) {
+        throw new AiEditError("arguments_invalid", "预览裁切范围无效。", 422);
+      }
+      if (!provider) throw new AiEditError("film_unavailable", "这个环境没有能渲染网页的浏览器。", 503);
+      signal?.throwIfAborted();
+      const id = `_preview-${randomBytes(8).toString("hex")}`, folder = path.join(directory, pageId ?? id);
+      const filename = pageId ? `${id}.html` : 'index.html', file = path.join(folder, filename);
+      let tab;
+      try {
+        if (pageId) await readFile(path.join(folder, 'index.html'));
+        else await mkdir(folder, { recursive: true, mode: 0o700 });
+        await writeFile(file, html, { mode: 0o600 });
+        tab = await openTab(provider, files.urlFor(getOrigin(), `pages/${pageId ?? id}/${filename}`), { width, height, background: transparent ? "transparent" : null });
+        const duration = tab.meta.duration;
+        if (!(duration > 0) || duration > MAX_PAGE_SECONDS || times.some(t => t >= duration)) throw new AiEditError("arguments_invalid", "预览秒数超出网页动画时长；保留真实动画时钟，不要把页面改成短时长定格。", 422);
+        const { default: sharp } = await import("sharp");
+        const images = [], pixels = [], diagnostics = [];
+        const shot = async () => {
+          const input = sharp(await tab.capture({ format: "png" }));
+          const { width: w, height: h } = await input.metadata();
+          const left = Math.min(w - 1, Math.floor(w * crop[0])), top = Math.min(h - 1, Math.floor(h * crop[1]));
+          const frame = input.extract({ left, top, width: Math.max(1, Math.min(w - left, Math.round(w * crop[2]))), height: Math.max(1, Math.min(h - top, Math.round(h * crop[3]))) });
+          return { image: `data:image/jpeg;base64,${(await frame.clone().flatten({ background: "black" }).resize({ width: 1280, height: 1280, fit: "inside", withoutEnlargement: true }).jpeg({ quality: 90 }).toBuffer()).toString("base64")}`,
+            pixels: await (transparent ? frame.ensureAlpha() : frame.flatten({ background: "black" }).removeAlpha()).resize(96, 96, { fit: "fill" }).raw().toBuffer() };
+        };
+        for (const time of times) {
+          signal?.throwIfAborted();
+          await tab.seek(time);
+          const frame = await shot();
+          images.push(frame.image); pixels.push(frame.pixels);
+          let dark = 0;
+          const channels = transparent ? 4 : 3;
+          for (let i = 0; i < frame.pixels.length; i += channels) if (Math.max(...frame.pixels.subarray(i, i + 3)) < 13) dark++;
+          diagnostics.push({ time, nearly_black: dark / (frame.pixels.length / channels) >= .995 });
+        }
+        // 按相反顺序重画，避免只在正向播放时正确的累加动画进入正式渲染。
+        for (let i = times.length - 1; i >= 0; i--) {
+          signal?.throwIfAborted();
+          await tab.seek(times[i]);
+          const again = (await shot()).pixels;
+          const delta = again.reduce((sum, n, j) => sum + Math.abs(n - pixels[i][j]), 0) / again.length / 255;
+          diagnostics[i].repeat_difference = Math.round(delta * 1e6) / 1e6;
+          diagnostics[i].unstable = delta > UNSTEADY;
+        }
+        signal?.throwIfAborted();
+        return { images, duration, diagnostics, problems: [...tab.problems] };
+      } finally {
+        await tab?.close().catch(() => undefined);
+        await rm(pageId ? file : folder, { recursive: !pageId, force: true });
+      }
+    }),
 
     /** 素材是不是网页片段：回它的 HTML 相对路径（pages/ 下），不是就是 null。 */
     pageOf(item) {
@@ -143,10 +228,8 @@ export function createPages({ root, library, files, provider, getOrigin }) {
      * AI 写的网页片段：新建（不给 pageId）或改写，存好再渲成素材。同一个页面改透明与否会换成新素材（后缀不同），
      * 回 { item, pageId, problems, duration, replaced }，replaced 是被换掉的旧素材 id。
      */
-    async write({ pageId = null, title, html, duration = null, width, height, transparent = false, fps, onProgress, signal }) {
-      if (typeof html !== "string" || !html.trim()) throw new AiEditError("page_empty", "网页内容是空的。", 422);
-      if (Buffer.byteLength(html) > MAX_PAGE_BYTES) throw new AiEditError("page_too_large", "网页太大了（超过 400KB），图片别内嵌，精简一下。", 422);
-      if (!/window\.film\b|\bfilm\s*=/u.test(html)) throw new AiEditError("page_not_film", "网页里要定义 window.film = { duration, frame(t) { … } }。", 422);
+    async write({ pageId = null, title, html, duration = null, width, height, transparent = false, fps, reference, onProgress, signal }) {
+      validateHtml(html);
       const id = pageId ?? randomBytes(8).toString("hex");
       if (!isPageId(id)) throw new AiEditError("page_not_found", "没有这个网页片段，新建时别填 page_id。", 404);
       const folder = path.join(directory, id);
@@ -162,7 +245,7 @@ export function createPages({ root, library, files, provider, getOrigin }) {
         const result = await render({
           rel: `${id}/index.html`, name: `${String(title ?? existing?.name ?? "网页片段").slice(0, 60)}`, width, height,
           duration, fallback: existing?.durationUs ? existing.durationUs / 1e6 : null,
-          transparent, fps, itemId: sameKind ? existing.id : null, pageId: id, onProgress, signal,
+          transparent, fps, itemId: sameKind ? existing.id : null, pageId: id, reference: reference ?? existing?.source?.reference, onProgress, signal,
         });
         return { ...result, pageId: id, replaced: existing && !sameKind ? existing.id : null };
       } catch (error) {

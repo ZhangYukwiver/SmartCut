@@ -1,4 +1,5 @@
 import React, { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { drawingTimes } from "../../../server/aiEdit/drawing.mjs";
 import { StyleSheet, Text, View } from "react-native";
 import {
   BookmarkPlus, Captions, CaptionsOff, ChevronDown, Film, Magnet, MousePointer2, MoveHorizontal, Music2, Paperclip, Plus, Scissors, SeparatorVertical, Sparkles,
@@ -1498,6 +1499,9 @@ const Clip = memo(function Clip({ segment, pxPerUs, mediaById, mediaUrl, reach, 
       {fade?.out_duration_us ? <span style={{ position: "absolute", right: 0, top: 0, height: 2, width: `${(fade.out_duration_us / span) * 100}%`, backgroundColor: tone }} /> : null}
       {(segment.keyframes ?? []).map((keyframe, index) => <span key={index} style={{
         position: "absolute", bottom: 1, left: `calc(${(keyframe.offset_us / span) * 100}% - 2px)`, width: 4, height: 4, transform: "rotate(45deg)", backgroundColor: color.text, opacity: 0.7,
+      }} />)}
+      {('drawing' in segment ? drawingTimes(segment.drawing ?? undefined) : []).filter(t => t >= 0 && t * 1e6 <= span).map(t => <span key={`drawing-${t}`} title={`动画节点 ${t.toFixed(3)} 秒`} style={{
+        position: "absolute", bottom: 7, left: `calc(${(t * 1e6 / span) * 100}% - 3px)`, width: 6, height: 6, transform: "rotate(45deg)", backgroundColor: "#e2ba66",
       }} />)}
       {transition && reach === "next" ? <span title={`转场 ${featureName(transition.transition_type)}`} style={{
         position: "absolute", right: 1, top: "50%", width: 7, height: 7, marginTop: -3.5, transform: "rotate(45deg)", backgroundColor: color.text, border: `1px solid ${color.surface}`,

@@ -74,12 +74,15 @@ function sampleTable(track, entry) {
 const handler = (component, type, name, mov) => full("hdlr", 0, 0, component ? ascii(component) : u32(0), ascii(type), zeros(12),
   mov ? Buffer.concat([u8(name.length), ascii(name)]) : ascii(`${name}\0`));
 
-function trak({ id, track, entry, timescale, sound, width = 0, height = 0, mov }) {
+function trak({ id, track, entry, timescale, sound, width = 0, height = 0, mov, primingSamples = 0, presentationSamples }) {
   const media = track.durations.reduce((sum, value) => sum + value, 0);
-  const movie = Math.round((media / timescale) * 1000);
+  const priming = Math.min(media, Math.max(0, Math.round(primingSamples)));
+  const presented = Math.min(media - priming, presentationSamples ?? media - priming);
+  const movie = Math.round((presented / timescale) * 1000);
   return box("trak",
     full("tkhd", 0, 3, u32(0), u32(0), u32(id), u32(0), u32(movie), zeros(8), u16(0), u16(sound ? 1 : 0), u16(sound ? 0x0100 : 0), u16(0), MATRIX,
       u32(width * 65536), u32(height * 65536)),
+    priming || presented < media ? box("edts", full("elst", 0, 0, u32(1), u32(movie), u32(priming), u16(1), u16(0))) : [],
     box("mdia",
       full("mdhd", 0, 0, u32(0), u32(0), u32(timescale), u32(media), u16(0x55c4), u16(0)),
       handler(mov ? "mhlr" : null, sound ? "soun" : "vide", sound ? "SoundHandler" : "VideoHandler", mov),
@@ -129,7 +132,8 @@ export async function openMovie(file, { container = "mp4" } = {}) {
       if (!video.sizes.length) throw new Error("影片里一帧都没有");
       const tracks = [trak({ id: 1, track: video, entry: visualEntry({ ...videoConfig, mov }), timescale: videoConfig.timescale, width: videoConfig.width, height: videoConfig.height, mov })];
       if (audioConfig && audio.sizes.length) {
-        tracks.push(trak({ id: 2, track: audio, entry: audioEntry(audioConfig), timescale: audioConfig.sampleRate, sound: true, mov }));
+        tracks.push(trak({ id: 2, track: audio, entry: audioEntry(audioConfig), timescale: audioConfig.sampleRate, sound: true, mov,
+          primingSamples: audioConfig.primingSamples, presentationSamples: audioConfig.presentationSamples }));
       }
       const seconds = video.durations.reduce((sum, value) => sum + value, 0) / videoConfig.timescale;
       const mvhd = full("mvhd", 0, 0, u32(0), u32(0), u32(1000), u32(Math.round(seconds * 1000)), u32(0x00010000), u16(0x0100), zeros(10), MATRIX, zeros(24), u32(tracks.length + 1));

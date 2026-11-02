@@ -24,7 +24,7 @@ export const CANVAS_OPTIONS = CANVASES.map(({ label }) => ({ label: label.split(
 export const canvasPreset = (canvas: EditCanvas) => CANVASES.find((item) => item.canvas.width === canvas.width && item.canvas.height === canvas.height)?.label ?? null;
 
 // 自己产生的素材就这几种；别的都是别的应用送来的视频（handoff，以及旧版数据里的老类型），界面上一律叫「送来的视频」
-const OWN_SOURCES: ReadonlySet<string> = new Set(["local", "page", "generated", "skill"]);
+const OWN_SOURCES: ReadonlySet<string> = new Set(["local", "page", "generated", "skill", "cutout", "image_edit"]);
 export const isSentMedia = (item: Pick<AiEditMediaItem, "source">): boolean => !OWN_SOURCES.has(item.source.type);
 
 export const mediaTitle = (item: AiEditMediaItem) => (item.source.type === "page" ? `网页 · ${item.name}` : (isSentMedia(item) && item.source.title) || item.name.replace(/\.[^.]+$/u, ""));

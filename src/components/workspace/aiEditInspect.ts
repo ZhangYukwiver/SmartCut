@@ -257,10 +257,10 @@ const KEYED: Partial<Record<FieldKey, { properties: readonly string[]; name: str
 };
 
 /** 这个字段有关键帧动画时改不了的原因：静态值会被动画盖掉；没有关键帧为 null */
-export function keyedReason(segment: Pick<EditSegment, "keyframes">, key: FieldKey): string | null {
+export function keyedReason(segment: Pick<EditSegment, "keyframes"> & { drawing?: unknown }, key: FieldKey): string | null {
   const keyed = KEYED[key];
   if (!keyed || !segment.keyframes?.some((item) => keyed.properties.includes(item.property))) return null;
-  return `这段的${keyed.name}有关键帧动画，在这里改会被动画盖掉，导进剪映后再调`;
+  return `这段的${keyed.name}有关键帧动画，在这里改会被动画盖掉，${segment.drawing ? '在下方图层动画中调整关键帧' : '导进剪映后再调'}`;
 }
 
 const timeEnd = (segment: EditSegment) => segment.timeline.start_us + segment.timeline.duration_us;

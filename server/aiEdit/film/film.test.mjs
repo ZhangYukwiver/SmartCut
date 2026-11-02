@@ -1,4 +1,5 @@
 import { createWriteStream } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import http from "node:http";
 import { tmpdir } from "node:os";
@@ -25,6 +26,29 @@ describe("pageFrames", () => {
 });
 
 describe("film", () => {
+  it("keeps drawing texture paths relative to the page when the desktop starts at the filesystem root", () => {
+    const result = execFileSync(process.execPath, ["--input-type=module", "-e", `
+      import { projectToFilm } from ${JSON.stringify(new URL("./filmFile.mjs", import.meta.url).href)};
+      const project = { canvas: { width: 100, height: 100 }, tracks: [{ track_type: 'video', segments: [{
+        id: 'panel', kind: 'image', path: '/media/pic.jpg', timeline: { start_us: 0, duration_us: 1000000 },
+        drawing: { type: 'panel', content: 'media', width: 100, height: 100, keys: [{ t: 0, quad: [[0,0],[1,0],[1,1],[0,1]], paint: {color:'#FFFFFF'} }] }
+      }] }] };
+      const urls = [
+        ['text/panel.html', '../../media/pic.jpg'],
+        ['text/nested/panel.html', 'assets/pic.jpg'],
+        ['panel.html', '../../media/pic.jpg'],
+        ['text/panel.html', 'https://example.com/pic.jpg'],
+      ].map(([page, media]) => {
+        const { texts } = projectToFilm(project, { mediaOf: () => null, srcFor: () => media, pageSrc: x => x, textSrc: () => page });
+        return JSON.parse(texts[0].html.match(/,src=("[^"]+")/)[1]);
+      });
+      process.stdout.write(JSON.stringify(urls));
+    `], { cwd: path.parse(process.cwd()).root, encoding: "utf8" });
+    expect(JSON.parse(result)).toEqual([
+      "../../../media/pic.jpg", "../../assets/pic.jpg", "../../media/pic.jpg", "https://example.com/pic.jpg",
+    ]);
+  });
+
   it("writes movies the server's probe reads back", async () => {
     const dir = await temp();
     const file = path.join(dir, "page.mov");
@@ -156,6 +180,32 @@ describe("film", () => {
     expect(names).toEqual([
       "共用文件/film.html", "共用文件/pages/_skills/vibe/engine.js", "共用文件/pages/_skills/vibe/img/cloud.jpg", "共用文件/pages/_vibe/timing.js", "共用文件/pages/abc/index.html",
     ]);
+  });
+
+  it("packs a page's library texture at the same relative path without unrelated media", async () => {
+    const root = await temp(), id = 'a'.repeat(32);
+    const texture = path.join(root, 'media', `${id}.png`);
+    await mkdir(path.join(root, 'pages', 'abc'), { recursive: true });
+    await mkdir(path.join(root, 'media'));
+    await writeFile(texture, 'texture bytes');
+    await writeFile(path.join(root, 'media', `${'b'.repeat(32)}.png`), 'unrelated');
+    await writeFile(path.join(root, 'pages', 'abc', 'index.html'), `<script>const texture='../../media/${id}.png';</script>`);
+    const item = { id: 'page', name: '长廊', width: 100, height: 100, source: { type: 'page', page: 'abc/index.html' } };
+    const studio = createFilmStudio({ root, library: {
+      idForPath: file => file === texture ? id : file === '/page.mp4' ? 'page' : null,
+      get: key => key === 'page' ? item : null,
+      readyPath: key => key === id ? texture : null,
+    }, provider: null, getOrigin: () => '' });
+    const project = { name: 'portable', canvas: { width: 100, height: 100, fps: 30 }, tracks: [{ id: 't', track_type: 'video', segments: [
+      { id: 's', kind: 'video', path: '/page.mp4', timeline: { start_us: 0, duration_us: 1_000_000 }, source: { start_us: 0, duration_us: 1_000_000 } },
+    ] }] };
+    const file = path.join(root, 'out.zip');
+    await studio.exportZip(project, createWriteStream(file));
+    const packed = unzipSync(await readFile(file));
+    const reference = Buffer.from(packed['portable/pages/abc/index.html']).toString().match(/'([^']+)'/u)[1];
+    const resolved = path.posix.normalize(path.posix.join('portable/pages/abc', reference));
+    expect(Buffer.from(packed[resolved]).toString()).toBe('texture bytes');
+    expect(Object.keys(packed)).toHaveLength(3);
   });
 
   it("serves pages with the host prelude, only under its key and areas", async () => {

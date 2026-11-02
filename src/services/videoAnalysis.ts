@@ -17,6 +17,7 @@ export interface AnalysisConfig {
   direction: string;
   /** 保存时测过：模型能不能直接看视频（看不了的话由解析库页面把视频拆成截图和节拍再给它）；没测过是 null */
   videoInput?: boolean | null;
+  imageInput?: boolean | null;
   /** 测的是哪个接口地址和模型，换了就要重测 */
   videoProbe?: string;
 }
@@ -64,10 +65,13 @@ export function loadAnalysisConfig(): AnalysisConfig {
     if (localModels) config.localModels = localModels;
     else delete config.localModels;
     // 测的不是现在这个模型就当没测过
-    if (typeof config.videoInput !== "boolean" || config.videoProbe !== videoProbeKey(config)) {
+    if (config.videoProbe !== videoProbeKey(config)) {
       delete config.videoInput;
       delete config.videoProbe;
+      delete config.imageInput;
     }
+    if (typeof config.videoInput !== "boolean") delete config.videoInput;
+    if (typeof config.imageInput !== "boolean") delete config.imageInput;
     return config;
   } catch {
     return DEFAULT_ANALYSIS_CONFIG;

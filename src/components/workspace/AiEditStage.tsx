@@ -23,6 +23,7 @@ import { useContextMenu, type MenuEntry, type MenuItem } from "./AiEditMenu";
 import { areaProps, mediaTitle, web, WebTitle, webPointer } from "./aiEditShared";
 import { kit } from "./CreatorKit";
 import { ws } from "./motion";
+import { DrawingLayer } from "./AiEditDrawingLayer";
 import { alpha, workspaceColors as color, workspaceFonts as font, workspaceRadii as radius } from "./workspaceTheme";
 
 // 看板上半部分的画面：按播放头画出这一刻的各个图层（视频、图片、文字、贴纸）。
@@ -161,7 +162,7 @@ export function Stage() {
       const transform = effectiveTransform(segment as EditMediaSegment, Math.max(0, shownTime - segment.timeline.start_us));
       const base = segment.kind === "text" ? textSize(segment.id)
         : segment.kind === "sticker" ? { width: stickerSide(stage), height: stickerSide(stage) }
-          : segment.kind === "video" || segment.kind === "image" ? layerBox(stage, materialOf(segment), segment.fit ?? "contain", segment.keyframes) : null;
+          : segment.kind === "video" || segment.kind === "image" ? segment.drawing ? stage : layerBox(stage, materialOf(segment), segment.fit ?? "contain", segment.keyframes) : null;
       if (!base) continue;
       const crop = segment.kind === "video" || segment.kind === "image" ? segment.crop : null;
       list.push({ id: original.id, trackIndex, segment: original, transform, alpha: Math.min(1, Math.max(0, transform.alpha)), frame: frameOf(stage, base, transform, crop) });
@@ -321,7 +322,7 @@ export function Stage() {
     if (!layer) return false;
     if (!canTouch()) { refuse(); return undefined; }
     const locks = keyframeLocks(layer.segment);
-    if (locks.move) { b.toast(lockNote(locks) ?? ""); return undefined; }
+    if (locks.move) { b.toast(lockNote(locks, 'drawing' in layer.segment && Boolean(layer.segment.drawing)) ?? ""); return undefined; }
     if (held.current && held.current.nudge.id !== layer.id) void flushNudge();
     const current = held.current;
     if (current) clearTimeout(current.timer);
@@ -373,7 +374,7 @@ export function Stage() {
     const b = latest.current;
     if (!canTouch()) { refuse(); return null; }
     const locks = keyframeLocks(layer.segment);
-    if ((kind === "move" && locks.move) || (kind === "scale" && locks.scale) || (kind === "rotate" && locks.rotate)) { b.toast(lockNote(locks) ?? ""); return null; }
+    if ((kind === "move" && locks.move) || (kind === "scale" && locks.scale) || (kind === "rotate" && locks.rotate)) { b.toast(lockNote(locks, 'drawing' in layer.segment && Boolean(layer.segment.drawing)) ?? ""); return null; }
     if (held.current) void flushNudge();
     const others = kind === "move" ? framesNow.current().filter((item) => item.id !== layer.id && item.alpha > 0).map((item) => frameAabb(item.frame)) : [];
     return {
@@ -679,7 +680,7 @@ export function Stage() {
   const single = selection.ids.length === 1 && selected ? selected.segment : null;
   const target = single && !playback.playing && !regionMode && editingText !== single.id ? frames.find((layer) => layer.id === single.id) ?? null : null;
   const locks = target ? keyframeLocks(target.segment) : null;
-  const note = locks ? lockNote(locks) : null;
+  const note = locks ? lockNote(locks, Boolean(target && 'drawing' in target.segment && target.segment.drawing)) : null;
   const handles = target && locks && (sending || showsTools({ editable, notEditableReason })) ? { scale: !locks.scale, rotate: !locks.rotate, edges: !locks.scale && STRETCHABLE.has(target.segment.kind) } : null;
   const cursorColors = handles?.rotate ? { light: cssColor(color.white, "#ffffff"), dark: cssColor(color.black, "#000000") } : null;
   const hovered = hover.id && !gesture && !regionMode && !playback.playing && !editingText ? frames.find((layer) => layer.id === hover.id) ?? null : null;
@@ -904,7 +905,7 @@ function Layer({ layer, active, canvas, stage, time, playing, mediaById, mediaUr
   const segment = override && FRAMED_KINDS.has(layer.segment.kind) ? withTransform(layer.segment, override) : layer.segment;
   const item = "path" in segment ? mediaById.get(mediaIdFromPath(segment.path) ?? "") : undefined;
   // 网页片段：看板上直接开它的网页、按时间画（底下渲好的视频留给剪映和出片用）
-  const page = segment.kind === "video" && item?.status === "ready" ? pageOf(item) : null;
+  const page = segment.kind === "video" && !segment.drawing && item?.status === "ready" ? pageOf(item) : null;
   const pageAddress = page ? filmUrl(`pages/${page}`) : null;
   // 网页改写后重渲的还是同一个素材：地址带上渲染时间，iframe 才会重新加载
   const pageUrl = pageAddress && item?.source.renderedAt ? `${pageAddress}?v=${item.source.renderedAt}` : pageAddress;
@@ -931,7 +932,7 @@ function Layer({ layer, active, canvas, stage, time, playing, mediaById, mediaUr
   // 有地址时只信元素读到的尺寸；没读到之前框按画布比例、让浏览器按 fit 自己摆，不拉伸。
   // 素材还没就绪时只画占位框，素材库的宽高够用
   const material = url ? natural : item?.width && item.height ? { width: item.width, height: item.height } : null;
-  const box = layerBox(stage, material, fit, segment.keyframes);
+  const box = segment.drawing ? stage : layerBox(stage, material, fit, segment.keyframes);
   const rect = layerRect(stage, box, transform);
   const mask = maskCss(segment.mask as MaskSpec | null | undefined, { width: rect.width, height: rect.height }, material);
   // 剪映的转场、动画、滤镜、特效：近似画出来（看得出加上了），以剪映为准
@@ -950,6 +951,10 @@ function Layer({ layer, active, canvas, stage, time, playing, mediaById, mediaUr
   const fill = active && segment.background_filling ? <div style={{ position: "absolute", inset: 0, backgroundColor: segment.background_filling.fill_type === "color" ? rgba(segment.background_filling.color ?? "#000000") : color.black, overflow: "hidden" }}>
     {segment.background_filling.fill_type === "blur" && segment.kind === "image" && url ? <img src={url} alt="" style={{ width: "100%", height: "100%", objectFit: "cover", filter: `blur(${Math.round(4 + (segment.background_filling.blur ?? 0.0625) * 60)}px)`, transform: "scale(1.1)" }} /> : null}
   </div> : null;
+  if (segment.drawing) return <>
+    <DrawingLayer segment={segment} canvas={canvas} url={url} offset={offset} playing={playing} active={active} style={style} />
+    {segment.kind === "video" && segment.drawing.content === "media" && url ? <MediaElement kind="audio" url={url} segment={segment} track={track} time={time} playing={playing} active={active} style={{ display: "none" }} /> : null}
+  </>;
   if (pageUrl && item?.width && item.height) {
     return <PageLayer url={pageUrl} layerId={segment.id} active={active} seconds={sourceTimeUs(segment as EditMediaSegment, time) / US_PER_SECOND}
       page={{ width: item.width, height: item.height }} style={{ ...style, opacity: active ? rect.opacity * look.opacity : 0 }} rect={rect} />;

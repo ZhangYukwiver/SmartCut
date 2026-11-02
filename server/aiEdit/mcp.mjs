@@ -1,5 +1,6 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import http from "node:http";
+import { TOOL_CONTENT } from './toolContent.mjs';
 
 // 本机 CLI（Codex、Claude Code）调剪辑工具用的 MCP 端点：每轮在 127.0.0.1 的随机端口上开一个，这一轮结束就关。
 // 只做 streamable HTTP 的最小子集：initialize、tools/list、tools/call、ping，POST 直接回 JSON，不开 SSE。
@@ -69,7 +70,7 @@ export async function openMcp({ tools, call }) {
       const result = await runTool(params.name, args);
       let text = JSON.stringify(result) ?? "{}";
       if (text.length > RESULT_CHARS) text = `${text.slice(0, RESULT_CHARS)}…（结果太长，后面略了）`;
-      return rpc(id, { content: [{ type: "text", text }], isError: result?.ok === false });
+      return rpc(id, { content: [{ type: "text", text }, ...(result?.ok !== false ? result?.[TOOL_CONTENT] ?? [] : [])], isError: result?.ok === false });
     }
     return rpcError(id, -32601, "不支持这个方法");
   };

@@ -356,12 +356,12 @@ export function keyframeLocks(segment: { keyframes?: Array<{ property: string }>
 }
 
 /** 框下面那句原因；什么都没挡时为 null。 */
-export function lockNote(locks: StageLocks): string | null {
+export function lockNote(locks: StageLocks, drawing = false): string | null {
   const parts = [locks.move && "位置", locks.scale && "大小", locks.rotate && "角度"].filter((part): part is string => Boolean(part));
   if (!parts.length) return null;
   const what = parts.length > 1 ? `${parts.slice(0, -1).join("、")}和${parts.at(-1)}` : parts[0];
   const verb = parts.length > 1 ? "改" : locks.move ? "拖" : locks.scale ? "缩放" : "转";
-  return `这段的${what}有关键帧动画，画面上不能直接${verb}，导进剪映后再调`;
+  return `这段的${what}有关键帧动画，画面上不能直接${verb}，${drawing ? '在右侧图层动画中调整关键帧' : '导进剪映后再调'}`;
 }
 
 // ---------- 方向键微调（C7） ----------

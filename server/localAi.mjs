@@ -341,7 +341,7 @@ export function codexArgs({ workDir, systemFile, mcpUrl, model, effort, features
 }
 
 /** 一行一个事件的解析：Claude 看 is_error 和 api_error_status，别看 subtype（接口出错时 subtype 照样是 success）。 */
-function claudeReader({ onText, onDelta, agent }) {
+function claudeReader({ onText, onDelta, agent, onUsage, onModel }) {
   let current = "";
   const state = { done: false, failure: null, apiError: null };
   return {
@@ -361,6 +361,7 @@ function claudeReader({ onText, onDelta, agent }) {
           current = "";
           return;
         }
+        if (typeof event.message?.model === "string") onModel?.(event.message.model);
         for (const block of event.message?.content ?? []) {
           if (block?.type === "text" && block.text) {
             current = "";
@@ -369,6 +370,7 @@ function claudeReader({ onText, onDelta, agent }) {
         }
       } else if (event.type === "result") {
         state.done = true;
+        if (event.usage) onUsage?.({ ...event.usage, ...(typeof event.total_cost_usd === "number" ? { total_cost_usd: event.total_cost_usd } : {}) });
         if (event.subtype === "error_max_turns") state.limit = true;
         else if (event.is_error) state.failure = { kind: "api", status: event.api_error_status ?? null, error: state.apiError, text: String(event.result ?? (event.errors ?? []).join(" ")) };
       }
@@ -377,14 +379,14 @@ function claudeReader({ onText, onDelta, agent }) {
 }
 
 /** Codex：只有 turn.completed 才算做完；单条 error 事件多半是配置提醒或重连，不算失败。 */
-function codexReader({ onText }) {
+function codexReader({ onText, onUsage }) {
   const state = { done: false, failure: null, lastError: "" };
   return {
     state,
     line(event) {
       if (event.type === "item.completed" && event.item?.type === "agent_message" && event.item.text) onText(event.item.text);
       else if (event.type === "error" && typeof event.message === "string") state.lastError = event.message;
-      else if (event.type === "turn.completed") state.done = true;
+      else if (event.type === "turn.completed") { state.done = true; if (event.usage) onUsage?.(event.usage); }
       else if (event.type === "turn.failed") state.failure = { kind: "api", text: unwrapMessage(event.error?.message) };
     },
   };
@@ -674,8 +676,9 @@ export function createLocalAi({
    * 不带工具问一次（看截图拆视频）：parts 是 OpenAI 形状的 content（文字和 data URL 图片交错），prompt 接在最后。返回回答全文。
    * Claude 原样交错成图文块；Codex 只能用 --image 附文件，文字里在原来的位置标上「第 k 张附图」。
    */
-  const ask = async (id, { model = "", parts = [], prompt, signal }) => {
+  const ask = async (id, { model = "", parts = [], prompt, signal, onUsage, onModel }) => {
     const { found, spec, model: chosen, authStore, apiKeyHelper } = await setup(id, model, signal);
+    if (chosen) onModel?.(chosen);
     const said = [];
     const onText = (text) => said.push(text);
     await withRunDir(async (dir) => {
@@ -690,7 +693,7 @@ export function createLocalAi({
         content.push({ type: "text", text: prompt });
         const input = `${JSON.stringify({ type: "user", message: { role: "user", content }, parent_tool_use_id: null, session_id: "" })}\n`;
         const args = claudeArgs({ systemFile, model: chosen, settingsFile: await helperFile(dir, apiKeyHelper), maxTurns: 1 });
-        await launch(id, { spec, args, env: await envFor(id, spec, {}), input, reader: claudeReader({ onText, onDelta: () => undefined, agent: false }), signal, model: chosen });
+        await launch(id, { spec, args, env: await envFor(id, spec, {}), input, reader: claudeReader({ onText, onDelta: () => undefined, agent: false, onUsage, onModel }), signal, model: chosen });
         return;
       }
       const images = [];
@@ -706,7 +709,7 @@ export function createLocalAi({
       }
       texts.push(prompt);
       const args = codexArgs({ workDir: await prepare(), systemFile, model: chosen, effort: "low", features: found.features, authStore, images });
-      await launch(id, { spec, args, env: await envFor(id, spec, {}), input: noSkillMention(texts.join("\n")), reader: codexReader({ onText }), signal, model: chosen });
+      await launch(id, { spec, args, env: await envFor(id, spec, {}), input: noSkillMention(texts.join("\n")), reader: codexReader({ onText, onUsage }), signal, model: chosen });
     });
     return said.join("\n\n");
   };

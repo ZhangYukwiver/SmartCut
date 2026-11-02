@@ -1,6 +1,7 @@
 import path from "node:path";
 
 import { FILM_FILE, clipKind, filmHtml, readFilmFile, srcHref } from "./vendor/film-doc.mjs";
+import { drawingPage } from "../drawing.mjs";
 
 // 剪辑工程 ↔ openfilm 的 film.html（协议 0.1，见 vendor/film-doc.mjs）。
 // film.html 只说片段在什么时候、放在哪（left/top/width/height/rotate）、透明度、音量、倍速和淡入淡出；剪映的特效、滤镜、转场、
@@ -119,6 +120,7 @@ export function projectToFilm(project, { mediaOf, srcFor, pageSrc, textSrc }) {
     const clips = [];
     for (const segment of track.segments ?? []) {
       for (const [key, name] of Object.entries(FEATURE_NAMES)) {
+        if (segment.drawing && key === "keyframes") continue;
         const value = segment[key];
         if (Array.isArray(value) ? value.length : value) drop(name);
       }
@@ -129,6 +131,25 @@ export function projectToFilm(project, { mediaOf, srcFor, pageSrc, textSrc }) {
       const fade = segment.fade ? [seconds(segment.fade.in_duration_us), seconds(segment.fade.out_duration_us)] : null;
       const overrides = fade && fade[0] + fade[1] > 0 && fade[0] + fade[1] <= length ? [{ fade }] : undefined;
       const transform = segment.transform ?? {};
+      if (segment.drawing && ["image", "video"].includes(segment.kind)) {
+        // film.html 只存毫秒，向下取入场时间并补回段内时钟，防止 0.566667 被写成 .567 而晚一帧。
+        const drawingAt = Math.floor(segment.timeline.start_us / 1000) / 1000;
+        const drawingLength = round3(seconds(segment.timeline.start_us + segment.timeline.duration_us) - drawingAt);
+        const drawn = { ...segment, drawing: { ...segment.drawing, offset: (segment.drawing.offset ?? 0) + drawingAt - segment.timeline.start_us / US } };
+        const src = textSrc(segment);
+        const item = mediaOf(segment.path);
+        const media = segment.drawing.content === "media" ? srcFor(item, segment.path) : null;
+        // 这里只处理网页内的相对路径，不能用 relative() 按进程 cwd 解析；桌面从 / 启动会吞掉 media 前的 ../。
+        const pageDepth = path.posix.dirname(src).split("/").filter((part) => part && part !== ".").length;
+        const relative = media ? (/^(?:[a-z]+:|\/)/iu.test(media) ? media : path.posix.join("../".repeat(pageDepth), media)) : null;
+        texts.push({ src, html: drawingPage(drawn, stage, relative) });
+        clips.push({ id: segment.id, src, at: drawingAt, time: [0, drawingLength] });
+        if (segment.kind === "video" && segment.drawing.content === "media" && segment.volume > 0) {
+          clips.push({ id: `${segment.id}-audio`, src: media, at, time: [seconds(segment.source.start_us), seconds(segment.source.start_us + segment.source.duration_us)],
+            sound: true, volume: segment.volume, speed: segment.speed ?? 1 });
+        }
+        continue;
+      }
       const look = [];
       if ((transform.alpha ?? 1) < 1) look.push(`opacity: ${round3(Math.max(0, transform.alpha))}`);
       if (transform.flip_horizontal || transform.flip_vertical) drop("翻转");

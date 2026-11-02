@@ -63,6 +63,7 @@ export function sessionDetail(session) {
     streaming: session.streaming ? {
       text: session.streaming.text,
       actions: session.streaming.actions.map((action) => ({ ...action })),
+      ...(session.streaming.visionCalls?.length ? { visionCalls: structuredClone(session.streaming.visionCalls) } : {}),
       // 要页面在浏览器里帮忙拆视频（截图、节拍）时挂在这里，页面做完交回
       ...(session.streaming.look ? { look: { ...session.streaming.look } } : {}),
       // 生成视频前等用户确认要不要花钱时挂在这里，页面画确认卡片

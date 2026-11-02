@@ -12,10 +12,15 @@ import { runCliConversation } from "./cliTurn.mjs";
 import { KEYFRAME_CURVES } from "./curves.mjs";
 import { EditError } from "./errors.mjs";
 import { createFilmStudio } from "./film/studio.mjs";
+import { patchPageHtml } from "./film/pages.mjs";
+import { pageCandidates } from './pageCandidates.mjs';
+import { requireCurrentVideoReview } from './videoReview.mjs';
 import { backgroundNote, parseGenerateConfig } from "./generate.mjs";
 import { AiEditError, MediaLibrary, isMediaId, publicItem } from "./library.mjs";
 import { displayName, withPreviewHints } from "./catalog.mjs";
 import { createCoverIndex } from "./jianyingCovers.mjs";
+import { createCutout } from "./cutout.mjs";
+import { createImageRefine } from "./imageRefine.mjs";
 import { createLookDesk } from "./look.mjs";
 import { SessionStore, isSessionId, revertTarget, sessionDetail } from "./sessions.mjs";
 import { createSpendDesk } from "./spend.mjs";
@@ -46,7 +51,9 @@ const DRAFT_CHANGED_AFTER_MS = 10_000;
 // 看板上能手动做的改动和各自放开的参数（null 是照工具定义）；update_clip 只放开时间、截取、倍速、文字和位置大小，update_track 只放开静音
 const BOARD_EDITS = new Map([
   ["move_clip", null],
-  ["update_clip", new Set(["clip_id", "start", "duration", "source_start", "source_duration", "speed", "text", "transform", "font_family"])],
+  ["update_clip", new Set(["clip_id", "start", "duration", "source_start", "source_duration", "speed", "text", "transform", "font_family", "media_id", "drawing", "fit"])],
+  ["add_keyframes", null],
+  ["remove_keyframe", null],
   ["split_clip", null],
   ["delete_clip", null],
   ["duplicate_clip", null],
@@ -517,6 +524,8 @@ export function createAiEdit({
   probe: injectedProbe,
   kindOf: injectedKindOf,
   skills: injectedSkills,
+  cutoutInfer,
+  imageRefineProcess,
   fetchImpl = modelFetch,
   covers = createCoverIndex(),
   now = () => new Date(),
@@ -562,6 +571,8 @@ export function createAiEdit({
     const skills = injectedSkills ?? (await import("./skills.mjs")).createSkills({ root });
     return {
       library, store, draftBox, sessions, looks: createLookDesk(), spends: createSpendDesk(), film, skills,
+      cutout: createCutout({ root, library, signal: shutdown.signal, infer: cutoutInfer }),
+      imageRefine: createImageRefine({ root, library, signal: shutdown.signal, processImage: imageRefineProcess }),
       commands: createSpendDesk({ timeoutMs: COMMAND_TIMEOUT_MS, texts: COMMAND_TEXTS }),
     };
   };
@@ -614,6 +625,9 @@ export function createAiEdit({
       if (status?.status !== "available") throw new AiEditError("draft_box_unavailable", "没找到剪映的草稿箱，先装好剪映、打开一次再试。", 503);
       const project = await store.getProject(session.projectId);
       if (!project.tracks.some((track) => track.segments?.length)) throw new AiEditError("project_empty", "时间线还是空的，先让 AI 加点素材再导入。", 422);
+      if (project.tracks.some(track => track.segments.some(segment => segment.drawing))) {
+        throw new AiEditError("drawing_draft_unsupported", "这个工程含可编辑的轮廓与分块蒙版。请用「出 MP4」保留效果；当前剪映草稿格式还不能保存这些动画。", 422);
+      }
       let media;
       try { media = await store.mediaInfos(project); }
       catch (error) {
@@ -655,16 +669,49 @@ export function createAiEdit({
   };
 
   /** 给模型的网页片段工具：按工程画布渲；改透明与否换了新素材时，把时间线上的旧素材换掉。 */
-  const pageTools = (session, signal) => ({
+  const pageTools = (session, signal, requireVideoReview = false) => {
+    const previews = pageCandidates(root, session.id);
+    return {
     read: (pageId) => state.film.pages.read(pageId),
+    preview: async (args) => {
+      const original = args.page_id ? await state.film.pages.read(args.page_id) : null;
+      if (args.html !== undefined && args.patches !== undefined) throw new AiEditError('arguments_invalid', 'html 和 patches 二选一。', 422);
+      const html = args.patches !== undefined ? patchPageHtml(original, args.patches) : args.html ?? original;
+      const project = await state.store.getProject(session.projectId);
+      const existing = args.page_id ? state.library.list().find(item => item.source?.pageId === args.page_id) : null;
+      const transparent = args.transparent ?? existing?.source?.transparent ?? false;
+      const result = await state.film.pages.preview({ html, pageId: args.page_id, times: args.times, crop: args.crop, ...project.canvas, transparent, signal });
+      // 相同秒数、裁切和画布重画正式版，评审才能区分“仍有差异”和“本次没有改善”。
+      const baselineNote = original !== null && html !== original && existing?.durationUs > 0
+        && args.times.some(time => time >= existing.durationUs / 1_000_000)
+        ? '采样包含原正式版时长以外的时刻，本次未提供修改前对照，不能判断相对旧版的改善。' : null;
+      const baseline = original !== null && html !== original && !baselineNote
+        ? await state.film.pages.preview({ html: original, pageId: args.page_id, times: args.times, crop: args.crop,
+          ...project.canvas, transparent: existing?.source?.transparent ?? false, signal }) : null;
+      const candidate = await previews.add({ html, original, pageId: args.page_id ?? null, canvas: { ...project.canvas }, transparent, duration: result.duration, reference: args.reference,
+        problems: result.problems, unstable: result.diagnostics.some(frame => frame.unstable) });
+      return { ...result, preview_id: candidate.id, ...(baseline ? { baseline } : {}), ...(baselineNote ? { baseline_note: baselineNote } : {}) };
+    },
     write: async (args) => {
       const { store, library } = state;
       const project = await store.getProject(session.projectId);
       const { width, height, fps } = project.canvas;
+      const candidate = args.preview_id ? await previews.get(args.preview_id) : null;
+      if (args.preview_id) {
+        if (!candidate) throw new AiEditError('preview_not_found', '这份预览已过期，请重新预览后再保存。', 422);
+        if (args.html !== undefined || args.duration !== undefined || args.transparent !== undefined || (args.page_id !== undefined && args.page_id !== candidate.pageId)) {
+          throw new AiEditError('arguments_invalid', '保存预览时只传 title、preview_id 和相同的 page_id；内容、时长和透明度取自已预览候选。', 422);
+        }
+        if (candidate.problems.length || candidate.unstable) throw new AiEditError('page_preview_failed', '预览发现加载、脚本或重画不一致问题，先修正并重新预览。', 422);
+        if (['width', 'height', 'fps'].some(key => project.canvas[key] !== candidate.canvas[key])) throw new AiEditError('page_conflict', '画布在预览后已改变，请按最新尺寸重新预览。', 409);
+        if (candidate.pageId && await state.film.pages.read(candidate.pageId) !== candidate.original) throw new AiEditError('page_conflict', '正式网页在预览后已改变，请读取最新版本再预览。', 409);
+      }
+      if (requireVideoReview) await requireCurrentVideoReview(candidate, project, state.film.reviewClips);
       const result = await state.film.pages.write({
-        pageId: args.page_id ?? null, title: args.title, html: args.html, duration: args.duration ?? null,
-        width, height, transparent: args.transparent === true, fps, signal,
+        pageId: candidate?.pageId ?? args.page_id ?? null, title: args.title, html: candidate?.html ?? args.html, duration: candidate?.duration ?? args.duration ?? null,
+        width, height, transparent: candidate?.transparent ?? args.transparent === true, fps, signal, reference: candidate?.reference,
       });
+      if (candidate) await previews.put({ ...candidate, adoptedAt: new Date().toISOString() });
       const target = library.filePath(library.get(result.item.id));
       const old = result.replaced ? library.get(result.replaced) : null;
       const segments = project.tracks.flatMap((track) => track.segments ?? []);
@@ -685,7 +732,8 @@ export function createAiEdit({
           : "还没放上时间线：用 add_media_clip 放进视频轨道（叠在视频上就放在更上层的轨道）。",
       };
     },
-  });
+    };
+  };
 
   const runTurn = async (session, config, signal, release = () => undefined, turn = {}) => {
     const { store, library, sessions } = state;
@@ -719,9 +767,16 @@ export function createAiEdit({
     });
     const runTool = createToolRunner({
       store, library, projectId: session.projectId, signal,
+      cutout: state.cutout,
+      imageRefine: state.imageRefine,
       config, references, fetchImpl, pollMs, localAi, freeOnly: turn.freeOnly,
       // 看视频用的配置（「解析视频」服务）；null 是用剪辑模型
       analysis: turn.analysis ?? null,
+      analysisIssue: turn.analysisIssue,
+      onVisionCall: (call) => {
+        (streaming.visionCalls ??= []).push(call);
+        void sessions.touch(session);
+      },
       // 活儿挂在这一轮上（streaming 不存盘），页面长轮询看到后接手
       askLook: (request) => state.looks.ask({
         id: session.id,
@@ -749,7 +804,11 @@ export function createAiEdit({
       shutdown: shutdown.signal,
       exportDraft: (mode) => exportSession(session, { mode }),
       onRename: (name) => { session.title = name; },
-      pages: pageTools(session, signal),
+      pages: pageTools(session, signal, Boolean(turn.pageRefine)),
+      candidates: pageCandidates(root, session.id),
+      reviewClips: state.film.reviewClips,
+      sessionId: session.id,
+      reviewBudget: { calls: 0, noImprovement: 0 },
       // arrange_grid 排过的格子记在会话上（跟着会话存盘），换画布时按新画布重排
       grids: session.grids,
     });
@@ -758,6 +817,13 @@ export function createAiEdit({
     let error = null;
     let stopped = false;
     try {
+      if (turn.refine) {
+        const { result, action } = await runTool('refine_reference', {});
+        streaming.actions.push(action);
+        await sessions.touch(session);
+        if (!result.ok) throw new AiEditError(result.code, result.message, 422);
+        text = result.note;
+      } else {
       // 本机 CLI 自己跑工具循环，工具经 MCP 回调同一个 execute（cliTurn.mjs）
       const converse = isLocalRuntime(config.runtime) ? runCliConversation : runConversation;
       const result = await converse({
@@ -776,7 +842,7 @@ export function createAiEdit({
         system: async () => buildSystemPrompt({
           project: await store.getProject(session.projectId), media: library.list(), goal: session.goal, freeOnly: turn.freeOnly,
           generation: { image: Boolean(turn.generation?.image), video: turn.generation?.video ? turn.generation.video.provider ?? "seedance" : false }, skills: turn.skills,
-        }),
+        }) + (turn.pageRefine ? '\n本轮用户点击自动校准，当前工程含网页动画。先读取当前时间线、页面和已有候选，依据用户纠正与实际连续画面判断合成结构，再做最小修改；不要把底层连续播放加上层遮罩揭开误建成每窗独立视频或移动贴图。已有结构判断和有效评审优先复用。preview_page只查构图和脚本异常，review_video_clip(preview_id,start,duration)在当前时间线连同底层一起渲染问题前后2–4秒复核运动，有改善且无回退后write_page(preview_id)。候选不必等静帧完全一致才检查视频。参考关系已保存，不重复解析整条参考；没有新证据不反复请求或盲调同组参数。最多4次视频复核，连续两份无改善就停止并报告差异。不确定时只补能区分结构假设的短区间；缺少干净底片就明确缺失，不用含效果的成片假冒原始底片。采纳前复查原来正常的关键时刻与转场，判断仅覆盖实际输入区间。视频服务不可用时明确运动未验证，不用截图代替。不反复导出全片，不调用只支持drawing的refine_reference，不另造时间线。缺少唯一参考时才问一个关键问题。' : ''),
         context: async () => buildContextMessage({ project: await store.getProject(session.projectId), library }),
         execute: async (call) => {
           const { result: output, action } = await runTool(call.name, call.arguments);
@@ -786,6 +852,7 @@ export function createAiEdit({
         },
       });
       text = result.text;
+      }
     } catch (failure) {
       sealHistory(session.history, closing ? "拆片工坊关掉了，这个工具没有执行。" : undefined);
       text = streaming.text;
@@ -808,9 +875,11 @@ export function createAiEdit({
       const note = stopped ? `（已停止）${later}` : later;
       text = text ? `${text}\n\n${note}` : note;
     }
-    if (text || actions.length) {
-      session.messages.push({ id: randomBytes(8).toString("hex"), role: "assistant", text, at: now().toISOString(), ...(actions.length ? { actions } : {}) });
+    if (text || actions.length || streaming.visionCalls?.length) {
+      session.messages.push({ id: randomBytes(8).toString("hex"), role: "assistant", text, at: now().toISOString(), ...(actions.length ? { actions } : {}),
+        ...(streaming.visionCalls?.length ? { visionCalls: streaming.visionCalls } : {}) });
     }
+    if (turn.refine) session.history.push({ role: 'assistant', content: text || error?.message || '自动校准已结束。' });
     const stored = trimHistory(session.history, STORED_HISTORY_CHARS);
     if (stored.length < session.history.length) session.trimmed = true;
     session.history = stored;
@@ -825,7 +894,7 @@ export function createAiEdit({
   };
 
   /** region、refs、attachments、generation、analysis 是 parseRegion、parseRefs、parseAttachments、parseGenerateConfig、parseEditConfig 校验过的。 */
-  const startTurn = async (session, text, config, { region = null, refs = [], attachments = [], freeOnly = false, generation = null, analysis = null } = {}) => {
+  const startTurn = async (session, text, config, { region = null, refs = [], attachments = [], freeOnly = false, generation = null, analysis = null, analysisIssue = null, refine = false } = {}) => {
     const { store, sessions } = state;
     const controller = new AbortController();
     const run = { controller, promise: null };
@@ -842,8 +911,14 @@ export function createAiEdit({
     // freeOnly：剪辑页勾了「只看免费」，这一轮不许用会员效果；generation：生成图片、视频的配置（没配是 null）；
     // skills：开跑时启用的技能，整轮用这一份（系统提示和工具清单一轮里不变，接口的前缀缓存才用得上）
     let skills = [];
-    try { skills = await state.skills.enabled(); } catch (error) { console.error("AI 剪辑读技能登记表失败:", error); }
-    const turn = { freeOnly, generation, skills, analysis };
+    const currentProject = refine ? await store.getProject(session.projectId) : null;
+    const pageRefine = Boolean(refine && currentProject.tracks.some(track => track.segments.some(segment => {
+      if (typeof segment.path !== 'string') return false;
+      const id = state.library.idForPath(segment.path);
+      return id && state.library.get(id)?.source?.type === 'page';
+    })));
+    if (!refine || pageRefine) try { skills = await state.skills.enabled(); } catch (error) { console.error("AI 剪辑读技能登记表失败:", error); }
+    const turn = { freeOnly, generation, skills, analysis, analysisIssue, refine: refine && !pageRefine, pageRefine };
     try {
       // 每轮开跑前存一份，可以撤销这一轮或者退回到这句话之前
       const { checkpoint, revision } = await saveCheckpoint(session, "turn", `AI 处理“${leading(text, 12)}”之前`);
@@ -1056,7 +1131,7 @@ export function createAiEdit({
     if (pathname === "/v1/ai-edit/looks") {
       if (method !== "GET") { notAllowed(); return; }
       const looks = [...sessions.sessions.values()].filter((session) => session.streaming?.look)
-        .map((session) => ({ sessionId: session.id, look: { ...session.streaming.look, url: `${session.streaming.look.url}?key=${encodeURIComponent(library.key)}` } }));
+        .map((session) => ({ sessionId: session.id, look: { ...session.streaming.look, url: `${session.streaming.look.url}${session.streaming.look.url.includes('?') ? '&' : '?'}key=${encodeURIComponent(library.key)}` } }));
       sendJson(response, 200, { looks });
       return;
     }
@@ -1190,6 +1265,8 @@ export function createAiEdit({
         try { await store.deleteProject(session.projectId); } catch { /* 工程已经没了 */ }
         // 出过的片子和导出的工程包（工程包里带着全部素材的副本）跟着删
         for (const folder of [id, `${id}-film`]) await rm(path.join(root, "renders", folder), { recursive: true, force: true }).catch(() => undefined);
+        await rm(path.join(root, 'renders', `${id}-review`), { recursive: true, force: true });
+        await rm(path.join(root, 'candidates', id), { recursive: true, force: true });
         sendJson(response, 200, { ok: true });
         return;
       }
@@ -1202,7 +1279,14 @@ export function createAiEdit({
         if (text.length > MAX_MESSAGE_CHARS) throw new AiEditError("message_too_long", "这条消息太长了，分几次说。");
         const config = parseEditConfig(body.config);
         // 「解析视频」服务（看参考视频、转写字幕用，和解析库同一份）：页面单独连了才带，没带就用剪辑模型来看
-        const analysis = body.analysis == null ? null : parseEditConfig(body.analysis);
+        let analysis = null, analysisIssue = null;
+        if (body.analysis != null) {
+          try { analysis = parseEditConfig(body.analysis); }
+          catch (error) {
+            if (error.code !== 'invalid_config') throw error;
+            analysisIssue = error.message;
+          }
+        }
         // 生成图片、视频的配置和 config 平级：本机 Codex / Claude 模式下 config 只带运行时和模型
         const generation = parseGenerateConfig(body.generation);
         const given = (value) => value !== undefined && value !== null;
@@ -1214,7 +1298,7 @@ export function createAiEdit({
         if (exporting.has(id)) throw new AiEditError("session_busy", "正在导入剪映，请稍等。", 409);
         if (editing.has(id)) throw new AiEditError("session_busy", "看板上的改动还没做完，请稍等。", 409);
         if (outputs.has(id)) throw new AiEditError("session_busy", "正在导出或导入工程，等它做完再说。", 409);
-        await startTurn(session, text, config, { region, refs, attachments, freeOnly: body.freeOnly === true, generation, analysis });
+        await startTurn(session, text, config, { region, refs, attachments, freeOnly: body.freeOnly === true, generation, analysis, analysisIssue, refine: body.refine === true });
         sendJson(response, 202, { session: sessionDetail(session) });
         return;
       }
@@ -1513,11 +1597,34 @@ export function createAiEdit({
       }
       return;
     }
+    const refineMatch = pathname.match(/^\/v1\/ai-edit\/media\/([^/]+)\/(image-refine|image-repair)(?:\/([^/]+))?$/u);
+    if (refineMatch) {
+      const [, id, action, jobId] = refineMatch;
+      if (jobId) {
+        if (method !== "GET" || action !== "image-repair") { notAllowed(); return; }
+        sendJson(response, 200, state.imageRefine.get(id, jobId));
+      } else {
+        if (method !== "POST") { notAllowed(); return; }
+        const body = await readJson(request, LOOK_BODY_BYTES);
+        if (action === "image-refine") sendJson(response, 201, { item: await state.imageRefine.save(id, body) });
+        else sendJson(response, 202, state.imageRefine.start(id, body));
+      }
+      return;
+    }
+    const cutoutMatch = pathname.match(/^\/v1\/ai-edit\/media\/([^/]+)\/cutout$/u);
+    if (cutoutMatch) {
+      if (method !== "POST" && method !== "GET") { notAllowed(); return; }
+      const job = method === "POST" ? state.cutout.start(cutoutMatch[1]) : state.cutout.get(cutoutMatch[1]);
+      sendJson(response, method === "POST" && job.status === "running" ? 202 : 200, job);
+      return;
+    }
     const mediaMatch = pathname.match(/^\/v1\/ai-edit\/media\/([^/]+)$/u);
     if (mediaMatch) {
       if (method !== "DELETE") { notAllowed(); return; }
       const item = isMediaId(mediaMatch[1]) ? library.get(mediaMatch[1]) : null;
       if (!item) throw new AiEditError("media_not_found", "素材库里没有这个素材。", 404);
+      if (state.cutout.busy(item.id)) throw new AiEditError("cutout_in_progress", "这张图片正在抠图，完成后再删除。", 409);
+      if (state.imageRefine.busy(item.id)) throw new AiEditError("image_edit_in_progress", "这张图片正在精修，完成后再删除。", 409);
       if (await mediaInUse(item)) throw new AiEditError("media_in_use", "有剪辑正在用这个素材，先从时间线上去掉再移除。", 409);
       const draft = await library.draftUsing(item);
       if (draft) throw new AiEditError("media_in_draft", `剪映草稿「${draft.name}」直接用着这个素材文件，先在剪映里删掉那份草稿再移除。`, 409);
@@ -1583,6 +1690,8 @@ export function createAiEdit({
       state.spends.close();
       state.commands.close();
       shutdown.abort();
+      state.cutout.close();
+      state.imageRefine.close();
       for (const run of running.values()) run.controller.abort();
       for (const job of outputs.values()) job.controller.abort();
       // 技能的前台、后台命令连同子进程一起杀掉，不等它们退出

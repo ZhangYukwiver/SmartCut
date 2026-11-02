@@ -4,6 +4,9 @@ import { normalizeServerBaseUrl, type Connection } from "../../services/connecti
 import { muxMp4, type MuxSample, type MuxTrack } from "../../services/mp4Mux";
 import { answerAnalysisLook, listPendingAnalysisLooks } from "../../services/videoAnalysis";
 import { detectBeats, detectFlashes, detectShots, type FrameSample } from "../../services/videoLook";
+import { reviewReplica } from '../../../server/aiEdit/replicaReview.mjs';
+import { measureReplica } from '../../../server/aiEdit/replicaMeasure.mjs';
+import { replicaInput } from '../../../server/aiEdit/replicaInput.mjs';
 
 // AI 剪辑请页面帮忙「看」视频：本机服务不带解码器，模型又看不了视频时，在浏览器里把参考视频拆成镜头截图、
 // 闪白位置和音乐节拍交回本机服务；给配乐测节拍也走这里。只用浏览器自带的解码（<video> 和 Web Audio），不装任何东西。
@@ -35,6 +38,8 @@ export interface LookAnswer {
   shots?: { start: number; end: number; frame: string | null }[];
   flashes?: number[];
   beats: { bpm: number; beats: number[]; strong: number[] } | null;
+  sheets?: { times: number[]; image: string }[];
+  sampleStep?: number;
 }
 
 class LookError extends Error {}
@@ -82,8 +87,8 @@ function openVideo(url: string, signal?: AbortSignal): Promise<HTMLVideoElement>
 }
 
 function seek(video: HTMLVideoElement, seconds: number): Promise<void> {
-  const target = Math.min(Math.max(0, seconds), Math.max(0, video.duration - 0.04));
-  if (Math.abs(video.currentTime - target) < 0.005 && video.readyState >= 2) return Promise.resolve();
+  const target = Math.min(Math.max(0, seconds), Math.max(0, video.duration - 0.001));
+  if (Math.abs(video.currentTime - target) < 0.000001 && video.readyState >= 2) return Promise.resolve();
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => { video.onseeked = null; reject(new LookError("视频跳转超时")); }, 10_000);
     video.onseeked = () => {
@@ -189,7 +194,7 @@ const round = (value: number) => Math.round(value * 100) / 100;
  * kind=reference：镜头、截图、闪白、节拍；kind=beats：只测节拍。url 是带 key 的本机服务文件地址。
  * 出错时抛的 Error 文案是给用户看的。
  */
-export async function lookAtVideo(url: string, kind: "reference" | "beats", signal?: AbortSignal): Promise<LookAnswer> {
+export async function lookAtVideo(url: string, kind: "reference" | "beats" | "replica", signal?: AbortSignal): Promise<LookAnswer> {
   try {
     const audio = await decodeAudio(url, signal);
     // ponytail: 节拍检测在主线程同步跑，一分钟以内的参考视频几十毫秒；三分钟的配乐在慢电脑上会卡一下，要更顺再挪进 Web Worker
@@ -210,11 +215,12 @@ export async function lookAtVideo(url: string, kind: "reference" | "beats", sign
       const bounds = [0, ...cuts.map(round), round(duration)];
       const shots = bounds.slice(0, -1).map((start, index) => ({ start, end: bounds[index + 1] ?? start })).filter((shot) => shot.end > shot.start);
       return {
-        duration: round(duration),
+        duration: kind === 'replica' ? Math.round(duration * 1e6) / 1e6 : round(duration),
         width: video.videoWidth || undefined,
         height: video.videoHeight || undefined,
         audio: Boolean(audio),
-        shots: await grabFrames(video, shots, signal),
+        shots: kind === 'replica' ? shots.map(s => ({ ...s, frame: null })) : await grabFrames(video, shots, signal),
+        ...(kind === 'replica' ? await replicaInput(url, signal) : {}),
         flashes: detectFlashes(samples).map(round),
         beats: tempo,
       };
@@ -227,6 +233,57 @@ export async function lookAtVideo(url: string, kind: "reference" | "beats", sign
     if ((error as { name?: string })?.name === "AbortError") throw new LookError("已停止");
     throw new LookError("浏览器里没能拆开这个视频");
   }
+}
+
+/** 从参考里取可替换的静态素材；声音保存为 PCM，避免二次 AAC 编码引入卡点延迟。 */
+export async function extractReference(url: string, crops: NonNullable<AiEditLookJob['crops']>, includeAudio: boolean, signal?: AbortSignal) {
+  const video = await openVideo(url, signal);
+  try {
+    if (video.duration > 180.1) throw new LookError('一次复刻支持 3 分钟以内的参考视频');
+    const canvas = document.createElement('canvas'), ctx = canvas.getContext('2d')!;
+    const assets: string[] = [];
+    for (const request of crops) {
+      signal?.throwIfAborted();
+      await seek(video, request.time);
+      const [x, y, w, h] = request.crop, sw = w * video.videoWidth, sh = h * video.videoHeight;
+      const scale = Math.min(1, 960 / Math.max(sw, sh));
+      canvas.width = Math.max(1, Math.round(sw * scale)); canvas.height = Math.max(1, Math.round(sh * scale));
+      ctx.drawImage(video, x * video.videoWidth, y * video.videoHeight, sw, sh, 0, 0, canvas.width, canvas.height);
+      assets.push(canvas.toDataURL('image/jpeg', .92));
+    }
+    let wav: string | null = null;
+    if (includeAudio) {
+      const audio = await decodeAudio(url, signal, 2, 44100);
+      if (!audio) throw new LookError('未能读出参考原声，时间轴尚未改动');
+      const channels = Math.min(2, audio.numberOfChannels), frames = Math.min(audio.length, Math.round(video.duration * audio.sampleRate));
+      const data = new ArrayBuffer(44 + frames * channels * 2), view = new DataView(data);
+      const ascii = (offset: number, text: string) => [...text].forEach((c, i) => view.setUint8(offset + i, c.charCodeAt(0)));
+      ascii(0, 'RIFF'); view.setUint32(4, data.byteLength - 8, true); ascii(8, 'WAVE'); ascii(12, 'fmt ');
+      view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, channels, true);
+      view.setUint32(24, audio.sampleRate, true); view.setUint32(28, audio.sampleRate * channels * 2, true);
+      view.setUint16(32, channels * 2, true); view.setUint16(34, 16, true); ascii(36, 'data'); view.setUint32(40, data.byteLength - 44, true);
+      for (let ch = 0; ch < channels; ch++) {
+        const pcm = audio.getChannelData(ch);
+        for (let i = 0; i < frames; i++) { const v = Math.max(-1, Math.min(1, pcm[i]!)); view.setInt16(44 + (i * channels + ch) * 2, Math.round(v * (v < 0 ? 32768 : 32767)), true); }
+      }
+      wav = await base64Of(new Blob([data], { type: 'audio/wav' }));
+    }
+    return { duration: video.duration, assets, wav };
+  } finally { video.removeAttribute('src'); video.load(); }
+}
+
+async function compareReference(url: string, job: AiEditLookJob, signal: AbortSignal) {
+  const layers = (job.layers ?? []).map(layer => {
+    if (!layer.media) return layer;
+    const reference = new URL(url), source = new URL(layer.media.url, reference);
+    if (source.origin !== reference.origin || !source.pathname.startsWith('/v1/ai-edit/media/')) throw new LookError('校准素材地址无效');
+    source.search = reference.search;
+    return { ...layer, media: { ...layer.media, url: source.toString() } };
+  });
+  if (job.kind === 'replica-review') return reviewReplica({ url, layers, crops: job.crops, signal, canvas: job.canvas, origin: job.origin });
+  const video = await openVideo(url, signal);
+  try { return await measureReplica({ video, layers, seek, signal }); }
+  finally { video.removeAttribute('src'); video.load(); }
 }
 
 const copyOf = (source: AllowSharedBufferSource) => ArrayBuffer.isView(source)
@@ -377,7 +434,10 @@ export function runLookJob(sessionId: string, job: AiEditLookJob, url: string, r
       if (controller.signal.aborted) return;
       let body: unknown;
       try {
-        body = job.kind === "squeeze" ? await squeezeVideo(url, job.bytes ?? 0, controller.signal) : await lookAtVideo(url, job.kind, controller.signal);
+        body = job.kind === "squeeze" ? await squeezeVideo(url, job.bytes ?? 0, controller.signal)
+          : job.kind === 'extract' ? await extractReference(url, job.crops ?? [], Boolean(job.audio), controller.signal)
+          : job.kind === 'replica-review' || job.kind === 'replica-measure' ? await compareReference(url, job, controller.signal)
+            : await lookAtVideo(url, job.kind, controller.signal);
       } catch (reason) {
         if (controller.signal.aborted) return;
         body = { error: reason instanceof Error ? reason.message : "浏览器里没能拆开这个视频" };
