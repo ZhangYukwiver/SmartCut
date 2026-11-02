@@ -11,6 +11,7 @@ import { openTab } from "./browser.mjs";
 import { QUALITY_BITS, encodeMp4 } from "./encoder.mjs";
 import { FILM_FILE, droppedText, filmToPlan, projectToFilm, transformOf } from "./filmFile.mjs";
 import { createPages } from "./pages.mjs";
+import { createReviewClips } from './reviewClips.mjs';
 import { createFilmFiles } from "./serve.mjs";
 
 // openfilm 工程化接进 AI 剪辑：网页片段（pages.mjs）、film.html 工程导出 / 导入（zip）、按 film.html 在本机出 MP4。
@@ -18,6 +19,7 @@ import { createFilmFiles } from "./serve.mjs";
 
 // 网页片段引用的共用文件夹：技能带的 ../_skills/<技能 id>/，早先手放的 ../_vibe/ 这类
 const SHARED_REF = /\.\.\/(_skills\/[\w-][\w.-]*|_(?!skills\/)[\w-][\w.-]*)\//gu;
+const MEDIA_REF = /(?:\.\.\/)+media\/[a-f0-9]{32}\.[a-z0-9]+/giu;
 const MAX_IMPORT_BYTES = 4 * 1024 ** 3;
 const MAX_IMPORT_FILES = 3_000;
 const US = 1_000_000;
@@ -38,6 +40,7 @@ export function createFilmStudio({ root, library, provider, getOrigin }) {
   return {
     files,
     pages,
+    reviewClips: createReviewClips({ root, library, files, provider, getOrigin }),
 
     /** 工程打包成 zip（film.html + assets/ + pages/ + text/）写进 out（文件写入流）。回没带过去的说明。 */
     async exportZip(project, out, { signal } = {}) {
@@ -45,6 +48,7 @@ export function createFilmStudio({ root, library, provider, getOrigin }) {
       const assets = [];
       const pageFolders = new Set();
       const pageFiles = new Set();
+      const pageMedia = new Map();
       const srcFor = (item, filePath) => {
         if (!names.has(filePath)) {
           const base = path.basename(item?.name || filePath).replace(/[\\/]/gu, "_");
@@ -68,6 +72,14 @@ export function createFilmStudio({ root, library, provider, getOrigin }) {
         for (const [, shared] of page.matchAll(SHARED_REF)) {
           const place = path.posix.normalize(path.posix.join(path.posix.dirname(rel), "..", shared));
           if (!place.startsWith("..") && ![...pageFolders].some((known) => place === known || place.startsWith(`${known}/`))) pageFolders.add(place);
+        }
+        // write_page 可以引用素材库中的图片；它们在页面文件夹外，打包时仍保持 ../../media/ 的相对位置。
+        for (const [reference] of page.matchAll(MEDIA_REF)) {
+          const target = path.resolve(pages.directory, path.dirname(rel), reference);
+          if (!within(path.join(root, "media"), target)) continue;
+          const id = library.idForPath(target);
+          if (!id || library.readyPath(id) !== target) throw new AiEditError("film_asset_missing", "网页引用的素材已不可用，未导出缺图工程。", 422);
+          pageMedia.set(`media/${path.basename(target)}`, target);
         }
       }
       const folder = safeName(project.name);
@@ -95,6 +107,7 @@ export function createFilmStudio({ root, library, provider, getOrigin }) {
       text(FILM_FILE, html);
       for (const page of texts) text(page.src, page.html);
       for (const asset of assets) await stream(asset.zip, asset.file);
+      for (const [name, file] of pageMedia) await stream(name, file);
       // 网页片段整个文件夹带上（页面可能引用旁边的图片、字体），连同它引用的共用文件夹
       for (const id of pageFolders) {
         const base = path.join(pages.directory, id);

@@ -54,7 +54,7 @@ type Probe = { key: string; running: boolean; error?: string };
 
 export function videoInputNote(config: AnalysisConfig, probe: Probe): string {
   if (probe.running) return "正在测这个模型能不能直接看视频……";
-  const known = config.videoInput === true ? "这个模型能直接看视频，画面和声音都能用上。"
+  const known = config.videoInput === true ? "已测出支持视频画面；音轨理解能力未单独验证。"
     : config.videoInput === false ? "这个模型看不了视频。解析时应用会先把视频拆成镜头截图和音乐节拍再交给它，听不到台词和旁白，这时要开着应用。"
       : null;
   if (probe.error) return known ? `这次没测出来（${probe.error}），先沿用上次的结果：${known}` : `没测出这个模型能不能直接看视频（${probe.error}）。解析时会先整段发给它，看不了再拆成截图。`;

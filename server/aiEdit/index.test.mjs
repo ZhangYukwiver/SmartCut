@@ -113,7 +113,7 @@ function fakeDraftBox(overrides = {}) {
 }
 
 /** 只说 CDP 的假渲染浏览器：页面一开就加载完，window.film 时长 0.1 秒（3 帧），截图回几个字节，编码页每帧回一个关键帧。 */
-function fakeFilmBrowser() {
+function fakeFilmBrowser(screenshot = Buffer.from("fake screenshot bytes")) {
   const value = (expression) => {
     if (expression.startsWith("Boolean(window.film")) return true;
     if (expression.includes("a.ready")) return { duration: 0.1, width: 64, height: 36, sounds: [] };
@@ -128,7 +128,7 @@ function fakeFilmBrowser() {
         on: (method, listener) => listeners.set(method, [...(listeners.get(method) ?? []), listener]),
         send: async (method, params) => {
           if (method === "Page.navigate") setTimeout(() => { for (const listener of listeners.get("Page.loadEventFired") ?? []) listener({}); });
-          if (method === "Page.captureScreenshot") return { data: Buffer.from("fake screenshot bytes").toString("base64") };
+          if (method === "Page.captureScreenshot") return { data: screenshot.toString("base64") };
           if (method === "Runtime.evaluate") return { result: { value: value(params.expression) } };
           return {};
         },
@@ -255,6 +255,102 @@ async function uploadFixture(call, name, as = name) {
 // ---------- 测试 ----------
 
 describe("AI edit help from the open page", () => {
+  it("uses the required editing model when optional analysis configuration is invalid and persists visual usage", async () => {
+    let mediaId, planned = 0;
+    const calls = [];
+    const fetchImpl = async (_url, init) => {
+      const body = JSON.parse(init.body); calls.push(body);
+      if (body.tools) return planned++ === 0 ? toolReply([{ name: 'analyze_reference', args: { media_id: mediaId } }]) : textReply('参考解析完成');
+      return Response.json({ choices: [{ message: { content: '① 实际可见的画面' } }], usage: { total_tokens: 12 } });
+    };
+    const { call, until, waitIdle } = await start({ fetchImpl });
+    mediaId = (await uploadFixture(call, 'clip-720p.mp4')).body.item.id;
+    const { session } = (await call('/v1/ai-edit/sessions', { method: 'POST', body: {} })).body;
+    expect((await call(`/v1/ai-edit/sessions/${session.id}/messages`, { method: 'POST', body: { text: '解析参考视频', config: CONFIG, analysis: { ...CONFIG, baseUrl: 'not-a-url' } } })).status).toBe(202);
+    const look = await until(async () => (await call(`/v1/ai-edit/sessions/${session.id}`)).body.session.streaming?.look, Boolean, 'reference look');
+    await call(`/v1/ai-edit/sessions/${session.id}/look/${look.id}`, { method: 'POST', body: {
+      duration: 3, width: 1280, height: 720, audio: true, shots: [{ start: 0, end: 3, frame: 'data:image/jpeg;base64,AAAA' }], flashes: [],
+    } });
+    const done = await waitIdle(session.id);
+    expect(done.session.status).toBe('idle');
+    expect(calls.every(c => c.model === CONFIG.model)).toBe(true);
+    expect(done.session.messages.at(-1).visionCalls).toEqual([expect.objectContaining({ role: '剪辑模型', input: 'images', usage: { total_tokens: 12 } })]);
+    expect(done.session.messages.at(-1).actions[0].visionNote).toContain('解析模型配置不可用');
+  });
+
+  it("dispatches the calibration button directly and returns the actual tool failure without a planning model", async () => {
+    const skills = fakeSkills();
+    skills.enabled = vi.fn(async () => { throw new Error('Calibration must not scan unrelated skills'); });
+    const fetchImpl = vi.fn(async () => { throw new Error('No planning model is needed'); });
+    const { call, waitIdle } = await start({ fetchImpl, skills });
+    const { session, project } = (await call('/v1/ai-edit/sessions', { method: 'POST', body: { title: '待校准工程' } })).body;
+    expect((await call(`/v1/ai-edit/sessions/${session.id}/messages`, { method: 'POST', body: { text: '自动校准', config: CONFIG, refine: true } })).status).toBe(202);
+    const result = await waitIdle(session.id);
+    expect(result.session.status).toBe('failed');
+    expect(result.session.error.message).toContain('参考关联');
+    expect(result.project).toEqual(project);
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(skills.enabled).not.toHaveBeenCalled();
+    expect(result.session.messages.at(-1).actions).toEqual([expect.objectContaining({ name: 'refine_reference', ok: false })]);
+  });
+
+  it("requires video evidence for calibration and retains the exact candidate across turns", async () => {
+    const original = '<script>window.film={duration:0.1,frame(){/* original */}}</script>';
+    const candidate = original.replace('original', 'candidate');
+    let pageId, previewId, referenceId, phase = 0;
+    const requests = [];
+    const fetchImpl = async (_url, init) => {
+      const body = JSON.parse(init.body);
+      if (!body.tools) {
+        const parts = body.messages.flatMap(message => Array.isArray(message.content) ? message.content : []);
+        expect(parts.filter(part => part.type === 'image_url')).toHaveLength(3);
+        expect(parts.filter(part => part.type === 'text').map(part => part.text).join('\n')).toContain('BASELINE 修改前正式版');
+        return textReply('接近但有差异：本次候选改善，锚点未见退步。');
+      }
+      requests.push(body); phase++;
+      if (phase === 1) return toolReply([{ name: 'write_page', args: { title: '动画', html: original } }]);
+      if (phase === 2) { pageId = lastToolResult(body).page_id; return textReply('初始动画'); }
+      if (phase === 3) return toolReply([{ name: 'preview_page', args: { page_id: pageId, patches: [{ find: 'original', replace: 'candidate' }], times: [.01], reference_media_id: referenceId, reference_offset: 1 } }]);
+      if (phase === 4) {
+        expect(lastToolResult(body), JSON.stringify(lastToolResult(body))).toMatchObject({ ok: true, preview_id: expect.any(String) });
+        previewId = lastToolResult(body).preview_id;
+        return toolReply([{ name: 'write_page', args: { title: '动画', preview_id: previewId, duration: 2 } }]);
+      }
+      if (phase === 5) {
+        expect(lastToolResult(body)).toMatchObject({ ok: false, code: 'arguments_invalid' });
+        return toolReply([{ name: 'write_page', args: { title: '动画', preview_id: previewId } }]);
+      }
+      if (phase === 6) { expect(lastToolResult(body)).toMatchObject({ ok: false, code: 'video_review_required' }); return textReply('候选保留，运动未验证'); }
+      if (phase === 7) return toolReply([{ name: 'get_page_candidates', args: { preview_id: previewId } }]);
+      if (phase === 8) { expect(lastToolResult(body)).toMatchObject({ ok: true, candidate: { html: candidate } }); return toolReply([{ name: 'write_page', args: { title: '动画', preview_id: previewId } }]); }
+      expect(lastToolResult(body)).toMatchObject({ ok: true, page_id: pageId });
+      return textReply('按用户要求保存跨轮候选');
+    };
+    const { call, waitIdle, until, store, directory } = await start({ fetchImpl, filmBrowser: fakeFilmBrowser(await readFile(path.join(FIXTURES, 'still.png'))), getOrigin: () => 'http://127.0.0.1:9' });
+    referenceId = (await uploadFixture(call, 'clip-720p.mp4')).body.item.id;
+    const { session, project } = (await call('/v1/ai-edit/sessions', { method: 'POST', body: {} })).body;
+    const send = (text, refine = false) => call(`/v1/ai-edit/sessions/${session.id}/messages`, { method: 'POST', body: { text, config: CONFIG, refine } });
+    await send('制作动画'); await waitIdle(session.id);
+    const made = lastToolResult(requests[1]);
+    const track = await store.createTrack(project.id, { track_type: 'video' });
+    await store.addMediaSegment(project.id, track.tracks[0].id, { path: await mediaPath(directory, `${made.media_id}.mp4`), timeline: { start_us: 0, duration_us: 100_000 } });
+    const before = await store.getProject(project.id);
+    await send('自动校准', true);
+    const look = await until(async () => (await call(`/v1/ai-edit/sessions/${session.id}`)).body.session.streaming?.look, Boolean, 'preview reference');
+    expect(look.crops).toEqual([{ time: 1.01, crop: [0, 0, 1, 1] }]);
+    await call(`/v1/ai-edit/sessions/${session.id}/look/${look.id}`, { method: 'POST', body: { duration: 3, width: 1280, height: 720, assets: [`data:image/jpeg;base64,${(await readFile(path.join(FIXTURES, 'still.jpg'))).toString('base64')}`] } });
+    const done = await waitIdle(session.id);
+    expect(done.session.status).toBe('idle');
+    expect(done.session.messages.at(-1).actions.map(a => a.name)).toEqual(['preview_page', 'write_page', 'write_page']);
+    expect(done.project).toEqual(before);
+    expect(await readFile(path.join(directory, 'ai-edit/pages', pageId, 'index.html'), 'utf8')).toBe(original);
+    await send('取回并保存这份候选'); await waitIdle(session.id);
+    const media = JSON.parse(await readFile(path.join(directory, 'ai-edit/media/index.json'), 'utf8')).find(item => item.id === made.media_id);
+    expect(media.source.reference).toEqual({ media_id: referenceId, offset: 1, crop: [0, 0, 1, 1], reference_crop: [0, 0, 1, 1] });
+    expect(requests[2].messages[0].content).toContain('当前工程含网页动画');
+    expect(await readFile(path.join(directory, 'ai-edit/pages', pageId, 'index.html'), 'utf8')).toBe(candidate);
+  }, 20_000);
+
   it("hangs a beat job on the running turn, serves the clip to the page and resumes with its answer", async () => {
     const requests = [];
     const ids = {};

@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { openMcp } from "./aiEdit/mcp.mjs";
+import { TOOL_CONTENT } from './aiEdit/toolContent.mjs';
 import { claudeArgs, claudeUserSettings, cliEnv, cliFailure, codexArgs, codexUserConfig, createLocalAi, findCli, loginShellEnv, parseLocalConfig, runFile, withoutHostVars } from "./localAi.mjs";
 
 const FAKE = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures/local-ai/fake-cli.mjs");
@@ -228,6 +229,21 @@ describe("local runtime status", () => {
 });
 
 describe("running a turn through the CLI", () => {
+  it('delivers actual images through MCP without embedding them in the JSON history result', async () => {
+    const { ai, records } = await fakeAi({ steps: [{ call: 'echo', arguments: { text: 'look' } }, { say: 'checked' }] });
+    const result = { ok: true, review: '看实际帧', [TOOL_CONTENT]: [
+      { type: 'text', text: 'REFERENCE 3 秒' }, { type: 'image', mimeType: 'image/jpeg', data: 'YQ==' },
+    ] };
+    const mcp = await openMcp({ tools: ECHO, call: async () => result });
+    cleanups.push(() => mcp.close());
+    await ai.converse('codex', { systemPrompt: 's', prompt: 'p', mcp });
+    const [record] = await records();
+    expect(record.results[0].content).toEqual([
+      { type: 'text', text: '{"ok":true,"review":"看实际帧"}' }, ...result[TOOL_CONTENT],
+    ]);
+    expect(JSON.stringify(result)).not.toContain('YQ==');
+  });
+
   for (const id of ["codex", "claude"]) {
     it(`${id}: calls our tools through MCP, streams what it says and keeps host variables and the secret off the command line`, async () => {
       const { ai, records, directory } = await fakeAi({ steps: [{ say: "先看一下" }, { call: "echo", arguments: { text: "嗨" } }, { say: "好了" }] });
@@ -321,6 +337,15 @@ describe("asking about screenshots", () => {
     expect(record.args.join(" ")).not.toContain("mcp_servers");
     expect(record.args).toContain('model_reasoning_effort="low"');
     expect(await readdir(path.join(directory, "local-ai", "runs"))).toEqual([]);
+  });
+
+  for (const runtime of ["codex", "claude"]) it(`${runtime}: reports returned usage without changing the answer`, async () => {
+    const usage = { input_tokens: 24, output_tokens: 8 };
+    const { ai } = await fakeAi({ usage, steps: [{ say: "看到了" }] });
+    const usages = [], models = [];
+    expect(await ai.ask(runtime, { model: "visual-model", parts, prompt: "分析", onUsage: value => usages.push(value), onModel: value => models.push(value) })).toBe("看到了");
+    expect(usages).toEqual([usage]);
+    expect(models).toContain("visual-model");
   });
 });
 

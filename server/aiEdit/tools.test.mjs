@@ -207,7 +207,7 @@ describe("AI edit tools", () => {
 
   it("cover every ProjectStore edit method and convert seconds and media ids", async () => {
     const { run, calls } = runnerWith();
-    const offline = new Set(["analyze_reference", "detect_beats", "write_page", "read_page", "generate_image", "generate_video", "transcribe_subtitles", ...SKILL_TOOLS]);
+    const offline = new Set(["remove_image_background", "inspect_image", "repair_image_regions", "extract_reference_frame", "review_video_frames", "review_video_clip", "get_page_candidates", "preview_page", "analyze_reference", "replicate_reference", "refine_reference", "add_drawing_clip", "update_drawing_clip", "detect_beats", "write_page", "read_page", "generate_image", "generate_video", "transcribe_subtitles", ...SKILL_TOOLS]);
     expect(TOOL_NAMES.filter((name) => !offline.has(name)).sort()).toEqual(Object.keys(SAMPLE_ARGS).sort());
     for (const [name, args] of Object.entries(SAMPLE_ARGS)) {
       const { result, action } = await run(name, JSON.stringify(args));
@@ -424,8 +424,10 @@ describe("AI edit tools", () => {
     expect(prompt).toContain(`- ${VIDEO_ID}｜视频｜海边.mp4｜10 秒｜1080×1920｜有声音`);
     expect(prompt).toContain("（还在导入）");
     expect(prompt).toContain("search_catalog");
-    expect(prompt).toContain("参考视频要先在素材库里");
-    expect(prompt).toContain("别人的视频只当参考，不要放进时间线");
+    expect(prompt).toContain("用户明确要求逐个对象独立编辑");
+    expect(prompt).toContain("复杂空间、摄影机或大量关联碎片可用 write_page");
+    expect(prompt).toContain("review_video_frames");
+    expect(prompt).toContain("不把原片的已完成特效段或完整截图冒充特效重建");
     expect(prompt).not.toMatch(/search_my_records|内容库/u);
     expect(prompt).toContain("越靠后的轨道越在上层");
     expect(prompt).toContain("所有时间参数都用秒");
@@ -1059,9 +1061,9 @@ describe("reference videos", () => {
       const media = await sentLibrary(directory);
       const sent = [];
       const references = new Map();
-      const runner = () => runnerWith({ library: media, config: EDIT, references, fetchImpl: answering("③ 0–2 秒｜硬切｜白字黑边", sent) }).run;
+      const runner = () => runnerWith({ visualInput: "video", library: media, config: EDIT, references, fetchImpl: answering("③ 0–2 秒｜硬切｜白字黑边", sent) }).run;
       const first = await runner()("analyze_reference", { media_id: VIDEO_ID });
-      expect(first.result).toEqual({
+      expect(first.result).toMatchObject({
         ok: true,
         video: { title: "热门转场", author: "阿明", duration: 15 },
         analysis: "③ 0–2 秒｜硬切｜白字黑边",
@@ -1090,7 +1092,7 @@ describe("reference videos", () => {
       const media = await sentLibrary(directory);
       const sent = [];
       const analysis = { ...EDIT, apiKey: "watch-key", model: "doubao-seed-watch" };
-      const { run } = runnerWith({ library: media, config: EDIT, analysis, references: new Map(), fetchImpl: answering("③ 0–2 秒｜硬切", sent) });
+      const { run } = runnerWith({ visualInput: "video", library: media, config: EDIT, analysis, references: new Map(), fetchImpl: answering("③ 0–2 秒｜硬切", sent) });
       expect((await run("analyze_reference", { media_id: VIDEO_ID })).result.ok).toBe(true);
       expect(sent[0].model).toBe("doubao-seed-watch");
     } finally {
@@ -1119,7 +1121,7 @@ describe("reference videos", () => {
       await writeFile(path.join(directory, `${VIDEO_ID}.mp4`), "fake-mp4");
       const asked = [];
       const askLook = async (request) => { asked.push(request); return LOOK; };
-      const watch = async (fetchImpl, extra = {}) => (await runnerWith({ library: media, config: EDIT, fetchImpl, ...extra }).run("analyze_reference", { media_id: VIDEO_ID })).result;
+      const watch = async (fetchImpl, extra = {}) => (await runnerWith({ visualInput: "video", library: media, config: EDIT, fetchImpl, ...extra }).run("analyze_reference", { media_id: VIDEO_ID })).result;
       const rejecting = async () => new Response(JSON.stringify({ error: { message: "unknown variant `video_url`, expected `text` or `image_url`" } }), { status: 400 });
 
       // 没有页面接手：说清楚要开着 AI 剪辑页面
@@ -1137,7 +1139,7 @@ describe("reference videos", () => {
         return answering("① 照截图拆的时间轴", sent)(url, init);
       };
       const result = await watch(fetchImpl, { askLook });
-      expect(result).toMatchObject({ ok: true, analysis: "① 照截图拆的时间轴", seen_as: expect.stringMatching(/^整段视频发过去被接口拒收（HTTP 400：.*截图/u), measured:{ shots: 3, bpm: 120, cuts_on_beat: "2/2", beat_synced: "切点太少，看不出是不是卡点" } });
+      expect(result).toMatchObject({ ok: true, analysis: "① 照截图拆的时间轴", seen_as: expect.stringContaining("改用连续帧图片"), measured:{ shots: 3, bpm: 120, cuts_on_beat: "2/2", beat_synced: "切点太少，看不出是不是卡点" } });
       expect(asked).toEqual([{ kind: "reference", url: `/v1/ai-edit/media/${VIDEO_ID}/file`, name: "参考.mp4" }]);
       const content = sent[0].messages[0].content;
       expect(content.filter((part) => part.type === "image_url").map((part) => part.image_url.url)).toEqual(["data:image/jpeg;base64,AAAA", "data:image/jpeg;base64,BBBB"]);
@@ -1162,9 +1164,9 @@ describe("reference videos", () => {
       expect(sent[0].messages[0].content.filter((part) => part.type === "image_url").every((part) => part.image_url.detail === "low")).toBe(true);
 
       // 截图也没看到（中转站连图片也丢了）
-      expect(await watch(answering(BLIND_REPLY), { askLook, config: { ...EDIT, videoInput: false } })).toMatchObject({ ok: false, code: "images_unsupported" });
-      expect(await watch(answering("NO_IMAGES"), { askLook, config: { ...EDIT, videoInput: false } })).toMatchObject({ ok: false, code: "images_unsupported" });
-      expect(await watch(answering("消息里只有镜头表和节拍数据，没有截图，画面只能写未知。"), { askLook, config: { ...EDIT, videoInput: false } })).toMatchObject({ ok: false, code: "images_unsupported" });
+      expect(await watch(answering(BLIND_REPLY), { askLook, config: { ...EDIT, videoInput: false } })).toMatchObject({ ok: false, code: "vision_unavailable" });
+      expect(await watch(answering("NO_IMAGES"), { askLook, config: { ...EDIT, videoInput: false } })).toMatchObject({ ok: false, code: "vision_unavailable" });
+      expect(await watch(answering("消息里只有镜头表和节拍数据，没有截图，画面只能写未知。"), { askLook, config: { ...EDIT, videoInput: false } })).toMatchObject({ ok: false, code: "vision_unavailable" });
       expect(await watch(answering("第 3 镜没有看到截图里有字幕，其余见表。\n| 1. 档案 | x |"), { askLook, config: { ...EDIT, videoInput: false } })).toMatchObject({ ok: true });
       // 看到了截图、只是照提示词交代了材料来源
       expect(await watch(answering(HONEST_REPLY), { askLook, config: { ...EDIT, videoInput: false } })).toMatchObject({ ok: true });
@@ -1175,7 +1177,7 @@ describe("reference videos", () => {
       // 正常的拆解里提到“无法读取视频里的小字”不算看不到
       expect(await watch(answering("| 维度 | 发现 |\n|---|---|\n| 画面 | 无法读取视频里的小字 |"))).toMatchObject({ ok: true });
       expect(await watch(async () => new Response(JSON.stringify({ error: { message: "the API key is invalid" } }), { status: 401 })))
-        .toMatchObject({ ok: false, code: "provider_error", message: expect.stringContaining("Key 不对") });
+        .toMatchObject({ ok: false, code: "vision_unavailable", message: expect.stringContaining("Key 不对") });
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
@@ -1189,11 +1191,11 @@ describe("reference videos", () => {
       media.items = [{ id: VIDEO_ID, kind: "video", status: "ready", name: "参考.mp4", file: `${VIDEO_ID}.mp4`, durationUs: 8_000_000, size: 8, source: { type: "local" } }];
       await writeFile(path.join(directory, `${VIDEO_ID}.mp4`), "fake-mp4");
       const references = new Map();
-      const run = (config, fetchImpl) => runnerWith({ library: media, references, config, fetchImpl, askLook: async () => LOOK }).run("analyze_reference", { media_id: VIDEO_ID });
+      const run = (config, fetchImpl) => runnerWith({ visualInput: "video", library: media, references, config, fetchImpl, askLook: async () => LOOK }).run("analyze_reference", { media_id: VIDEO_ID });
       expect((await run({ ...EDIT, videoInput: false }, answering("① 截图版"))).result).toMatchObject({ ok: true, analysis: "① 截图版", seen_as: expect.any(String) });
       // 同一个模型（不管测没测过）：直接用缓存
       expect((await run({ ...EDIT, videoInput: false }, async () => { throw new Error("不该再请求"); })).result).toMatchObject({ ok: true, analysis: "① 截图版" });
-      expect((await run({ ...EDIT, videoInput: null }, async () => { throw new Error("不该再请求"); })).result).toMatchObject({ ok: true, analysis: "① 截图版" });
+      expect((await run({ ...EDIT, videoInput: null }, answering("① 重测版"))).result).toMatchObject({ ok: true, analysis: "① 重测版" });
       // 换成能看视频的别的模型：重新整段看
       const fresh = (await run({ ...EDIT, model: "doubao-seed-2-1-lite-260915", videoInput: true }, answering("① 整段版"))).result;
       expect(fresh).toMatchObject({ ok: true, analysis: "① 整段版" });
@@ -1248,7 +1250,7 @@ describe("reference videos", () => {
       await writeFile(path.join(directory, `${AUDIO_ID}.mp4`), "");
       await truncate(path.join(directory, `${AUDIO_ID}.mp4`), 46 * 1024 * 1024);
       const sent = [];
-      const { run } = runnerWith({ library: media, config: EDIT, references: new Map(), fetchImpl: answering("① 三段式", sent) });
+      const { run } = runnerWith({ visualInput: "video", library: media, config: EDIT, references: new Map(), fetchImpl: answering("① 三段式", sent) });
       const { result, action } = await run("analyze_reference", { media_id: VIDEO_ID });
       expect(result).toMatchObject({ ok: true, video: { title: "参考.mp4", duration: 8 }, analysis: "① 三段式" });
       expect(action.summary).toBe("解析了参考视频「参考.mp4」");
@@ -1283,7 +1285,7 @@ describe("reference videos", () => {
         if (outcome instanceof Error) throw outcome;
         return { duration: 8, audio: true, video: outcome };
       };
-      const watch = async (askLook, fetchImpl) => (await runnerWith({ library: media, config: { ...EDIT, videoInput: true }, askLook, fetchImpl }).run("analyze_reference", { media_id: AUDIO_ID })).result;
+      const watch = async (askLook, fetchImpl) => (await runnerWith({ visualInput: "video", library: media, config: { ...EDIT, videoInput: true }, askLook, fetchImpl }).run("analyze_reference", { media_id: AUDIO_ID })).result;
 
       // 页面压到 45MB 以内：整段发压好的那份，不拆截图
       const sent = [];
@@ -1301,7 +1303,7 @@ describe("reference videos", () => {
       expect((await watch(squeezing(Buffer.alloc(46 * 1024 * 1024)), answering("② 截图版"))).seen_as).toContain("页面压过以后还有 46.0MB");
       let calls = 0;
       const tooLarge = async (url, init) => (++calls === 1 ? new Response(JSON.stringify({ error: { message: "request entity too large" } }), { status: 413 }) : answering("② 截图版")(url, init));
-      expect((await watch(squeezing(small), tooLarge)).seen_as).toContain("整段视频发过去被接口拒收（HTTP 413：");
+      expect((await watch(squeezing(small), tooLarge)).seen_as).toContain("改用连续帧图片");
       // 没有页面来压：照常报要开着应用
       expect(await watch(squeezing(new AiEditError("look_unavailable", "没有开着的应用页面", 409)), answering("不该用到"))).toMatchObject({ ok: false, code: "look_unavailable" });
     } finally {

@@ -12,6 +12,7 @@ import { comboText, composing, IS_MAC, shortcutText, textBoxKey } from "./aiEdit
 import { ariaDisabledProps, clipTone, mediaTitle, pressableDisabled, web, WebTitle, webAutoHeight, webPointer } from "./aiEditShared";
 import { kit, SmallButton } from "./CreatorKit";
 import { ws } from "./motion";
+import { DrawingEditor } from "./AiEditDrawingEditor";
 import { workspaceColors as color, workspaceFonts as font, workspaceRadii as radius } from "./workspaceTheme";
 
 // 选中片段时画面右边的详情卡：顶上能引用到对话、切开、删除；开始、时长、素材起点、倍速、位置、缩放、旋转、不透明度是能拖、能输的数值框；
@@ -99,6 +100,7 @@ function ClipBody({ projectNow, iconOnly }: { projectNow: () => EditProject | nu
       {fields.length ? <FieldList fields={fields} version={project?.revision ?? 0} blocked={lasting} onCommit={commitField} onRefuse={(text) => toast(text)} /> : null}
       {web && segment.kind === "video" ? <SpeedCurveEditor segment={segment} blocked={lasting} run={curveEdit("set_curve_speed")} /> : null}
       {web && keyed ? <KeyframeCurveEditor segment={segment} blocked={lasting} run={curveEdit("set_keyframe_curve")} /> : null}
+      {web && 'drawing' in segment && segment.drawing ? <DrawingEditor segment={segment} /> : null}
       {info.rows.filter((row) => !covered.has(row.label)).map((row, index) => <View key={index} style={styles.detailRow}>
         <Text style={styles.detailLabel}>{row.label}</Text>
         <View style={styles.detailValueBox}>

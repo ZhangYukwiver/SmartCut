@@ -3,7 +3,7 @@ import { ActivityIndicator, Image, Pressable, ScrollView, StyleSheet, Text, Text
 import { Check, ChevronDown, Clock, Film, FolderOpen, ImageIcon, ImagePlus, Library, Music2, Plus, Scissors, Send, Settings2, Sparkles, Square, SquareDashed, Target, Trash2, X } from "lucide-react-native";
 import type { Connection } from "../../services/connection";
 import {
-  aiConfigReady, aiEditFilmUrl, aiEditLookUrl, aiEditMediaUrl, aiRuntimeOf, importAiEditFilm, startAiEditOutput, answerAiEditLook, answerAiEditSpend, borrowArkKey, isArkUrl, isLocalAiRuntime, createAiEditSession, deleteAiEditMedia, deleteAiEditSession, exportAiEditSession, generateConfigProblem, generationForRequest, getAiEditDraftBox, getAiEditSession,
+  aiConfigReady, aiEditFilmUrl, aiEditLookUrl, aiEditMediaUrl, aiRuntimeOf, cutoutAiEditMedia, importAiEditFilm, startAiEditOutput, answerAiEditLook, answerAiEditSpend, borrowArkKey, isArkUrl, isLocalAiRuntime, createAiEditSession, deleteAiEditMedia, deleteAiEditSession, exportAiEditSession, generateConfigProblem, generationForRequest, getAiEditDraftBox, getAiEditSession,
   keepValidGenerateUrls, listAiEditMedia, listAiEditSessions, loadAiEditConfig, loadAiEditGenerateConfig, probeAiEditVideo, revertAiEdit, saveAiEditConfig, saveAiEditGenerateConfig, sendAiEditMessage, sessionRunning,
   searchAiEditCatalog, setAiEditGoal, stopAiEditSession, uploadAiEditMedia, videoProbeKey, DEFAULT_AI_EDIT_GENERATE_CONFIG, MAX_MESSAGE_ATTACHMENTS, MAX_MESSAGE_REFS,
   type AiEditAction, type AiEditCatalogItem, type AiEditCatalogKind, type AiEditChatItem, type AiEditConfig, type AiEditDraftBoxStatus, type AiEditExportMode, type AiEditGenerateConfig, type AiEditGenerateService, type AiEditMediaItem,
@@ -26,6 +26,8 @@ import { CommandCard } from "./AiEditSkills";
 import { areaProps, CANVASES, Expand, errorText, isSentMedia, mediaTitle, shortTime, webAutoHeight, webPointer, web, type BoardRegion } from "./aiEditShared";
 import { runtimeProblem } from "./AiRuntimeField";
 import { AiEditSettings, type AiEditSettingsSection } from "./AiEditSettings";
+import { AiEditImageEditor } from "./AiEditImageEditor";
+import { AiEditVisionUsage } from './AiEditVisionUsage';
 import { dropLookJobs, runLookJob } from "./aiEditLook";
 import { createUploadQueue } from "./aiEditUploads";
 import { kit, Segmented, SmallButton } from "./CreatorKit";
@@ -74,10 +76,13 @@ function rememberSession(id: string | null) {
 }
 
 const SUGGESTIONS = [
+  "把参考视频做成同款，自动对照画面校准效果",
   "把素材库里的视频剪成 30 秒的竖屏短片，配上字幕",
   "按音乐节拍把这几段素材卡点剪在一起",
   "每段之间加转场，开头淡入、结尾淡出",
 ];
+const REPLICA_REQUEST = "把引用的参考视频做成同款，保留画面构图、文字、特效与节奏，原声单独成轨。按效果选择可编辑图层或可修改的网页动画；复杂空间和摄影机运动不要强行拆成二维图层。自动选择原始取景、清理需要去除的字幕，先做真实关键帧预览，对照参考自行校准，再生成完整动画并复查过渡。如实说明剩余差异，不把原片已完成特效段当成重建。";
+const REFINE_REQUEST = "自动对照原片校准当前已有工程，自行发现差距并多轮修正。保留已替换的素材和原声音轨，只保存经过渲染对照确有改善的版本；连续没有改善就停止，并告诉我停止原因和剩余差异。";
 
 function AiEditWorkspaceImpl({ connection, onReconnect }: Props) {
   const baseUrl = connection?.baseUrl ?? null;
@@ -94,6 +99,9 @@ function AiEditWorkspaceImpl({ connection, onReconnect }: Props) {
   const [state, setState] = useState<AiEditSessionState | null>(null);
   const [media, setMedia] = useState<AiEditMediaItem[]>([]);
   const [mediaKey, setMediaKey] = useState("");
+  const [cutting, setCutting] = useState<Record<string, string>>({});
+  const cutoutPending = useRef(new Set<string>());
+  const [imageEditing, setImageEditing] = useState<string | null>(null);
   // 网页片段、film.html 和做好的文件的地址 key（本机服务每次启动换一个）
   const [filmKey, setFilmKey] = useState("");
   // 正在上传的 openfilm 工程包：上传进度（0–1）；没在传是 null
@@ -129,6 +137,7 @@ function AiEditWorkspaceImpl({ connection, onReconnect }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
+  const [referenceUpload, setReferenceUpload] = useState<number | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
   const mediaUrl = useCallback((id: string) => (baseUrl && mediaKey ? aiEditMediaUrl(baseUrl, id, mediaKey) : null), [baseUrl, mediaKey]);
   const filmUrl = useCallback((path: string, download = false) => (baseUrl && filmKey ? aiEditFilmUrl(baseUrl, filmKey, path, download) : null), [baseUrl, filmKey]);
@@ -148,6 +157,8 @@ function AiEditWorkspaceImpl({ connection, onReconnect }: Props) {
   // 附的图、拖进来的文件没传完（或预览没画好）先不发
   const uploading = attachmentsPending(shownFiles);
   const mediaById = useMemo(() => new Map(media.map((item) => [item.id, item])), [media]);
+  const hasPageClips = project?.tracks.some(track => track.segments.some(segment =>
+    'path' in segment && mediaById.get(mediaIdFromPath(segment.path) ?? '')?.source.type === 'page')) ?? false;
   // AI 停下来等用户点头：花钱生成视频，或者运行技能里的命令
   const waitingFor = session?.streaming?.spend ? "等你确认要不要生成视频" : session?.streaming?.command ? "等你确认要不要运行技能命令" : null;
   // 能在看板上手动改：有工程、AI 没在剪、没在导入、上一个手动改动已经回来；AI 停下来等确认时直说在等用户
@@ -376,11 +387,11 @@ function AiEditWorkspaceImpl({ connection, onReconnect }: Props) {
     }
   };
 
-  const send = async (raw = input) => {
+  const send = async (raw = input, reference?: AiEditMediaItem, calibrate = false) => {
     const text = raw.trim();
     if (!conn || !text || running || editLock.current || uploading) return;
     // 发的是此刻看得到的引用和附图；发出去之后才加的留着
-    const outgoing = shownDraft;
+    const outgoing = reference || calibrate ? null : shownDraft;
     if (!aiConfigReady(config)) {
       setSettings("model");
       setError("先在 AI 设置里填好 Key 和模型。");
@@ -397,14 +408,15 @@ function AiEditWorkspaceImpl({ connection, onReconnect }: Props) {
         setError(problem);
         return;
       }
-      const target = currentId ? { id: currentId, project } : await createSession().then((created) => created && { id: created.session.id, project: created.project });
+      const target = currentId && !reference ? { id: currentId, project } : await createSession().then((created) => created && { id: created.session.id, project: created.project });
       if (!target) return;
-      const framed = region && target.id === currentId ? region : null;
-      const refs = outgoing?.refs ?? [];
+      const framed = !calibrate && region && target.id === currentId ? region : null;
+      const refs: ComposerRef[] = reference ? [{ kind: 'media', mediaId: reference.id }] : outgoing?.refs ?? [];
       const files = outgoing?.files ?? [];
       // 「解析视频」和借方舟 Key 都要读解析库那份配置：可能刚在别的页面改过，每次发的时候现读
       const analysis = loadAnalysisConfig();
       const next = await sendAiEditMessage(conn, target.id, text, config, {
+        refine: calibrate,
         region: framed && { time_us: framed.time_us, x: framed.x, y: framed.y, width: framed.width, height: framed.height, clip_ids: framed.clip_ids },
         // 片尾之后的时刻不发（小条上写着），发了后端会整条拒收
         refs: sendableRefs(refs, target.project).map(refRequest),
@@ -414,7 +426,8 @@ function AiEditWorkspaceImpl({ connection, onReconnect }: Props) {
         generation: generationForRequest(generate, config, analysis),
         analysis: aiConfigReady(analysis) ? analysis : null,
       });
-      setInput("");
+      if (!reference && !calibrate) setInput("");
+      setLeftTab('chat');
       if (framed) setRegionDraft((current) => (current?.sessionId === target.id ? null : current));
       // 这一排全部清掉（没发的片尾之后的时刻也清）；还没有剪辑时发的，这一排已经交给了新建的剪辑
       if (outgoing) setDraft((current) => clearSent(current, [outgoing.sessionId, target.id], { refs, files }));
@@ -424,6 +437,19 @@ function AiEditWorkspaceImpl({ connection, onReconnect }: Props) {
     } finally {
       setSending(false);
     }
+  };
+
+  const uploadReference = async (file: File) => {
+    if (!conn || running || sending || referenceUpload !== null || editLock.current || uploading) return;
+    if (!aiConfigReady(config)) { setSettings('model'); setError('先连接 AI 模型，再上传参考视频复刻。'); return; }
+    setReferenceUpload(0); setError(null);
+    try {
+      const item = await uploadAiEditMedia(conn, file, setReferenceUpload);
+      setMedia(list => list.some(m => m.id === item.id) ? list : [...list, item]);
+      if (item.kind !== 'video') { setError('参考复刻需要视频文件，已上传的素材仍在素材库。'); return; }
+      await send(REPLICA_REQUEST, item);
+    } catch (reason) { setError(errorText(reason, '参考视频没传上去，请重试。')); }
+    finally { setReferenceUpload(null); }
   };
 
   /** 存目标；还没有剪辑就先新建一个。成功返回 true，失败提示在错误条里 */
@@ -536,6 +562,22 @@ function AiEditWorkspaceImpl({ connection, onReconnect }: Props) {
       setDraft((current) => dropMedia(current, id));
       await loadMedia();
     } catch (reason) { setError(errorText(reason, "没删掉，请稍后重试。")); }
+  };
+
+  const cutoutMedia = async (id: string) => {
+    if (!conn || cutoutPending.current.has(id)) return;
+    cutoutPending.current.add(id);
+    setCutting(value => ({ ...value, [id]: "正在准备抠图…" }));
+    try {
+      const item = await cutoutAiEditMedia(conn, id, job => setCutting(value => ({ ...value,
+        [id]: `${job.stage}${job.progress !== null && job.status === "running" ? ` ${Math.round(job.progress * 100)}%` : "…"}`,
+      })));
+      setMedia(value => [item, ...value.filter(other => other.id !== item.id)]);
+    } catch (reason) { setError(errorText(reason, "图片抠图失败，请重试。")); }
+    finally {
+      cutoutPending.current.delete(id);
+      setCutting(value => { const next = { ...value }; delete next[id]; return next; });
+    }
   };
 
   const pickRegion = useCallback((value: BoardRegion) => {
@@ -696,11 +738,19 @@ function AiEditWorkspaceImpl({ connection, onReconnect }: Props) {
             uploads={uploads.tasks}
             mediaUrl={mediaUrl}
             onPick={(item) => refer([{ kind: "media", mediaId: item.id }])}
+            onReplicate={running || sending || uploading || editBusy || referenceUpload !== null ? undefined : item => void send(REPLICA_REQUEST, item)}
             onRemove={(id) => void removeMedia(id)}
             onUpload={uploadFiles}
+            cutting={cutting}
+            onCutout={conn ? id => void cutoutMedia(id) : undefined}
+            onEditImage={setImageEditing}
           />
         : <>
           <GoalBar sessionId={currentId} goal={session?.goal ?? ""} onSave={saveGoal} />
+          {hasPageClips || project?.tracks.some(track => track.segments.some(segment => 'drawing' in segment && segment.drawing?.referenceId)) ? <View style={styles.noticeBar}>
+            <Text style={styles.noticeText}>{hasPageClips ? '先判断合成结构，局部修改后连同底层复核短片；有改善才采纳，并记录用量。' : '逐帧找差异，检查快速转场和短闪，修正后复核，可撤销。'}</Text>
+            <SmallButton label="自动校准" disabled={running || sending || uploading || editBusy || building} onPress={() => void send(REFINE_REQUEST, undefined, true)} />
+          </View> : null}
           <View style={styles.middle}>
             <Conversation session={session} loaded={sessionsLoaded} running={running} editable={editable} mediaUrl={mediaUrl} inline={replyInline} streamText={streamText}
               onSuggest={(text) => setInput(text)} onRevert={revert} onSpend={answerSpend} onCommand={answerCommand} />
@@ -711,7 +761,8 @@ function AiEditWorkspaceImpl({ connection, onReconnect }: Props) {
             {shownRefs.map((ref) => <RefChip key={refKey(ref)} kind={ref.kind} label={refLabelOf(ref)} onRemove={() => unrefer(ref)}
               onShow={ref.kind === "clip" ? () => jumpTo({ clipId: ref.clipId }) : ref.kind === "time" ? () => jumpTo({ timeUs: ref.timeUs }) : undefined} />)}
           </View> : null}
-          <Composer value={input} onChange={setInput} running={running} waiting={waitingFor} sending={sending} blocked={editBusy} uploading={uploading} onFiles={attachFiles} onSend={() => void send()} onStop={() => void stop()} />
+          <Composer value={input} onChange={setInput} running={running} waiting={waitingFor} sending={sending} blocked={editBusy} uploading={uploading || referenceUpload !== null} onFiles={attachFiles}
+            onReference={file => void uploadReference(file)} referenceUpload={referenceUpload} onSend={() => void send()} onStop={() => void stop()} />
         </>}
     {dropping ? <View pointerEvents="none" style={styles.dropMask}>
       <Text style={styles.dropText}>{leftTab === "chat" ? "松开就加进这句话：图片会带给 AI 看，别的文件放进素材库并引用" : "松开就放进素材库"}</Text>
@@ -749,6 +800,12 @@ function AiEditWorkspaceImpl({ connection, onReconnect }: Props) {
       sideWidth={leftWidth}
     />
 
+    {imageEditing && media.some(item => item.id === imageEditing) ? <AiEditImageEditor
+      key={`${baseUrl}:${imageEditing}`} connection={conn} item={media.find(item => item.id === imageEditing)!}
+      original={(() => { const item = media.find(item => item.id === imageEditing)!; return item.source.mediaId ? media.find(other => other.id === item.source.mediaId) ?? null : item; })()}
+      mediaUrl={mediaUrl} onClose={() => setImageEditing(null)}
+      onSaved={item => setMedia(value => [item, ...value.filter(other => other.id !== item.id)])}
+    /> : null}
     <AiEditSettings
       visible={settings !== null}
       section={settings ?? "model"}
@@ -957,10 +1014,12 @@ function Conversation({ session, loaded, running, editable, mediaUrl, inline, st
     }}
   >
     {session?.trimmed ? <Text style={styles.note}>对话比较长了，更早几轮的细节 AI 只记得你当时说的话；一直要照着做的要求写进上面的目标更稳。</Text> : null}
+    <AiEditVisionUsage cumulative calls={[...messages.flatMap(m => m.visionCalls ?? []), ...(session?.streaming?.visionCalls ?? [])]} />
     {messages.map((item) => <Message key={item.id} item={item} revertible={!running && revertible.has(item.id)} editable={editable} mediaUrl={mediaUrl} inline={inline} onRevert={onRevert} />)}
     {busy ? <View {...ws("c-bubble", "in")} style={[styles.bubble, styles.bubbleIn]}>
       {streaming ? <Markdown compact ink text={streamText(streaming)} /> : null}
       {liveActions.length ? <ActionList actions={liveActions} live /> : null}
+      <AiEditVisionUsage calls={session?.streaming?.visionCalls} />
       {spend ? <SpendCard key={spend.id} ask={spend} onAnswer={onSpend} /> : null}
       {command ? <CommandCard key={command.id} ask={command} onAnswer={onCommand} /> : null}
       <View style={kit.row}><ActivityIndicator size="small" color={color.cyan} /><Text {...ws("ai-shimmer")} style={kit.muted}>{spend ? "等你确认要不要生成视频…" : command ? "等你确认要不要运行这条命令…" : generating ? generating : look ? (look.kind === "beats" ? "正在测配乐的节拍…" : look.kind === "squeeze" ? "视频太大，正在本机压一份小的再交给 AI…" : "正在把参考视频拆成镜头截图和节拍，拆完交给 AI 看…") : working ? "正在改时间线…" : streaming ? "还在写…" : "AI 正在想…"}</Text></View>
@@ -970,7 +1029,7 @@ function Conversation({ session, loaded, running, editable, mediaUrl, inline, st
 }
 
 /** 只看不改的步骤：出现了也不说「正在改时间线」 */
-const LOOK_ONLY_ACTIONS = new Set(["see_images", ...SKILL_TOOLS]);
+const LOOK_ONLY_ACTIONS = new Set(["see_images", "preview_page", "review_video_frames", "review_video_clip", "get_page_candidates", "read_page", ...SKILL_TOOLS]);
 const touchesTimeline = (action: { name: string }) => !LOOK_ONLY_ACTIONS.has(action.name);
 
 /** 空画面上那句「AI 正在搭时间线…」（看板的 running 只管这一句）：停下来等确认、正在跑技能命令或生成图片视频（服务挂着 generating
@@ -1009,6 +1068,7 @@ function Message({ item, revertible = false, editable = false, mediaUrl, inline,
   return <View {...ws("c-bubble", "in")} style={[styles.bubble, styles.bubbleIn]}>
     {item.text ? <Markdown compact text={item.text} inline={inline} /> : null}
     {item.actions?.length ? <ActionList actions={item.actions} /> : null}
+    <AiEditVisionUsage calls={item.visionCalls} />
   </View>;
 }
 
@@ -1067,7 +1127,11 @@ function ActionList({ actions, live = false }: { actions: AiEditAction[]; live?:
   const first = live ? Math.max(0, actions.length - 4) : 0;
   const row = (action: AiEditAction, index: number) => <View key={index} {...ws("ai-step")} style={styles.actionRow}>
     <View style={styles.actionIcon}>{action.ok ? <Check size={12} color={color.green} /> : <X size={12} color={color.danger} />}</View>
-    <Text style={[styles.actionText, !action.ok && { color: color.danger }]}>{action.summary}{!action.ok && action.error ? `：${action.error}` : ""}</Text>
+    <View style={{ flex: 1 }}>
+      <Text style={[styles.actionText, !action.ok && { color: color.danger }]}>{action.summary}{!action.ok && action.error ? `：${action.error}` : ""}</Text>
+      {action.visionNote ? <Text style={styles.actionText}>{action.visionNote}</Text> : null}
+      <VideoReviewRecord value={action.verification} />
+    </View>
   </View>;
   return <View {...ws("ai-steps")} style={styles.actions}>
     {live && first > 0 ? <Text style={styles.actionText}>前面已经做了 {first} 步</Text> : null}
@@ -1081,9 +1145,33 @@ function ActionList({ actions, live = false }: { actions: AiEditAction[]; live?:
   </View>;
 }
 
-function MediaShelf({ media, uploads, mediaUrl, onPick, onRemove, onUpload }: {
+function VideoReviewRecord({ value }: { value: unknown }) {
+  const [expanded, setExpanded] = useState(false);
+  if (!value || typeof value !== 'object' || !('kind' in value) || value.kind !== 'video-clip') return null;
+  const record = value as Record<string, unknown>;
+  if (typeof record.start !== 'number' || typeof record.duration !== 'number' || typeof record.summary !== 'string') return null;
+  const verdict = ({ improved: '有改善', unchanged: '无明显改善', regressed: '有回退', uncertain: '未能确定' } as Record<string, string>)[String(record.decision)] ?? '未能确定';
+  const lines = (key: string) => Array.isArray(record[key]) ? (record[key] as unknown[]).filter((v): v is string => typeof v === 'string') : [];
+  return <View style={{ gap: 4, paddingTop: 4 }}>
+    <Pressable accessibilityRole="button" accessibilityLabel="查看视频复核记录" accessibilityState={{ expanded }} onPress={() => setExpanded(v => !v)} style={webPointer}>
+      <Text style={styles.linkText}>{record.start}–{Math.round((record.start + record.duration) * 100) / 100} 秒 · {verdict} · {record.ready_to_adopt === true ? '可采纳' : '暂不采纳'}{expanded ? ' ▴' : ' ▾'}</Text>
+    </Pressable>
+    {expanded ? <>
+      <Text selectable style={styles.actionText}>{record.summary}</Text>
+      {(['evidence', 'regressions', 'remaining'] as const).map(key => lines(key).length ? <Text selectable key={key} style={styles.actionText}>
+        {{ evidence: '依据', regressions: '回退', remaining: '剩余差异' }[key]}：{lines(key).join('；')}
+      </Text> : null)}
+      <Text style={styles.actionText}>仅覆盖这段视频，未验证音轨和全片。</Text>
+    </> : null}
+  </View>;
+}
+
+function MediaShelf({ media, uploads, mediaUrl, onPick, onReplicate, onRemove, onUpload, cutting, onCutout, onEditImage }: {
   media: AiEditMediaItem[]; uploads: Array<{ key: string; name: string; progress: number }>; mediaUrl: (id: string) => string | null;
   onPick: (item: AiEditMediaItem) => void; onRemove: (id: string) => void; onUpload: (files: File[]) => void;
+  onReplicate?: (item: AiEditMediaItem) => void;
+  cutting: Record<string, string>; onCutout?: (id: string) => void;
+  onEditImage: (id: string) => void;
 }) {
   const inputRef = useRef<HTMLInputElement | null>(null);
   const [confirm, setConfirm] = useState<string | null>(null);
@@ -1109,20 +1197,35 @@ function MediaShelf({ media, uploads, mediaUrl, onPick, onRemove, onUpload }: {
           <MediaThumb item={item} url={mediaUrl(item.id)} />
           <Text numberOfLines={1} style={styles.cardName}>{mediaTitle(item)}</Text>
           <Text numberOfLines={1} style={[styles.cardMeta, item.status === "failed" && { color: color.danger }]}>
-            {item.status === "importing" ? "正在导入…" : item.status === "failed" ? (item.error || "导入失败") : `${isSentMedia(item) ? "送来的视频 · " : item.source.type === "generated" ? "AI 生成 · " : item.source.type === "skill" ? `技能${item.source.skill ? ` · ${item.source.skill}` : ""} · ` : ""}${item.kind === "image" ? "图片" : item.durationUs ? spokenDuration(item.durationUs) : item.kind === "audio" ? "音频" : "视频"}`}
+            {item.status === "importing" ? "正在导入…" : item.status === "failed" ? (item.error || "导入失败") : `${isSentMedia(item) ? "送来的视频 · " : item.source.type === "cutout" ? "抠图 · 透明 PNG · " : item.source.type === "image_edit" ? "精修 · PNG · " : item.source.type === "generated" ? "AI 生成 · " : item.source.type === "skill" ? `技能${item.source.skill ? ` · ${item.source.skill}` : ""} · ` : ""}${item.kind === "image" ? "图片" : item.durationUs ? spokenDuration(item.durationUs) : item.kind === "audio" ? "音频" : "视频"}`}
           </Text>
         </Pressable>
+        {item.kind === "image" && item.status === "ready" && item.source.type !== "cutout" ? <Pressable accessibilityRole="button"
+          accessibilityLabel={`给「${mediaTitle(item)}」自动抠图`} accessibilityState={{ busy: Boolean(cutting[item.id]) }}
+          disabled={!onCutout || Boolean(cutting[item.id])} onPress={() => onCutout?.(item.id)}
+          style={[webPointer, { paddingVertical: 5, opacity: onCutout ? 1 : .5 }]}>
+          <Text style={styles.linkText}>{cutting[item.id] || "自动抠图"}</Text>
+        </Pressable> : null}
+        {item.kind === "image" && item.status === "ready" ? <Pressable accessibilityRole="button" accessibilityLabel={`精修「${mediaTitle(item)}」`}
+          disabled={Boolean(cutting[item.id])} onPress={() => onEditImage(item.id)} style={[webPointer, { paddingVertical: 5 }]}>
+          <Text style={styles.linkText}>精修 / 去字</Text>
+        </Pressable> : null}
+        {item.kind === 'video' && item.status === 'ready' ? <Pressable accessibilityRole="button" accessibilityLabel={`把「${mediaTitle(item)}」复刻为可编辑时间轴`}
+          disabled={!onReplicate} onPress={() => onReplicate?.(item)} style={[webPointer, { paddingVertical: 5, opacity: onReplicate ? 1 : .5 }]}>
+          <Text style={styles.linkText}>复刻为可编辑时间轴</Text>
+        </Pressable> : null}
         {confirm === item.id
           ? <View style={styles.cardConfirm}>
             <Pressable accessibilityRole="button" onPress={() => { setConfirm(null); onRemove(item.id); }} style={webPointer}><Text style={styles.dangerLink}>删除</Text></Pressable>
             <Pressable accessibilityRole="button" onPress={() => setConfirm(null)} style={webPointer}><Text style={styles.cardMeta}>取消</Text></Pressable>
           </View>
-          : <Pressable accessibilityRole="button" accessibilityLabel={`从素材库删除「${mediaTitle(item)}」`} hitSlop={6} onPress={() => setConfirm(item.id)} style={[styles.cardRemove, webPointer]}>
+          : <Pressable accessibilityRole="button" accessibilityLabel={`从素材库删除「${mediaTitle(item)}」`} disabled={Boolean(cutting[item.id])} hitSlop={6} onPress={() => setConfirm(item.id)} style={[styles.cardRemove, webPointer]}>
             <X size={11} color={color.white} />
           </Pressable>}
       </View>)}
     </ScrollView> : <Text style={[kit.muted, styles.shelfEmpty]}>还没有素材：选本机的视频、图片和音乐，或者从别的应用把视频送过来。</Text>}
     {media.length ? <Text style={[kit.muted, styles.shelfEmpty]}>点一个素材就引用到对话里，跟 AI 说「这个素材」它就知道是哪个。</Text> : null}
+    {media.some(item => item.kind === "image") ? <Text style={[kit.muted, styles.shelfEmpty]}>自动抠图在本机处理并保留原图。首次需下载约 192MB 模型，之后可离线使用。</Text> : null}
   </View>;
 }
 
@@ -1137,6 +1240,8 @@ function MediaThumb({ item, url }: { item: AiEditMediaItem; url: string | null }
   </View>;
   if (view.show === "audio") return <View style={[styles.thumb, styles.thumbEmpty]}><Music2 size={18} color={color.green} /></View>;
   return <View style={[styles.thumb, styles.thumbEmpty]}>
+    {item.source.type === "cutout" || item.source.type === "image_edit" ? <div aria-hidden style={{ position: "absolute", inset: 0, backgroundColor: "#ddd",
+      backgroundImage: "conic-gradient(#aaa 25%, transparent 0 50%, #aaa 0 75%, transparent 0)", backgroundSize: "16px 16px" }} /> : null}
     {view.show === "image" ? <img src={url} alt="" draggable={false} style={thumbMedia} />
       : cover ? <img src={cover} alt="" draggable={false} referrerPolicy="no-referrer" style={thumbMedia} onError={() => setFailedCover(cover)} />
         // 只读元数据时 Chrome 不一定画出第一帧；读到时长后主动跳到半秒处，让它取一帧画上
@@ -1313,7 +1418,7 @@ function renamePasted(files: File[]): File[] {
   return files.map((file) => { const name = pastedName(file.name, file.type, now); return name === file.name ? file : new File([file], name, { type: file.type }); });
 }
 
-function Composer({ value, onChange, running, waiting, sending, blocked, uploading, onFiles, onSend, onStop }: {
+function Composer({ value, onChange, running, waiting, sending, blocked, uploading, onFiles, onReference, referenceUpload, onSend, onStop }: {
   value: string; onChange: (text: string) => void; running: boolean; sending: boolean;
   /** AI 停下来等用户确认（生成视频、运行技能命令）时占位的那句话；没在等是 null */
   waiting: string | null;
@@ -1323,11 +1428,14 @@ function Composer({ value, onChange, running, waiting, sending, blocked, uploadi
   uploading: boolean;
   /** 贴进来的、点「附图」选的文件 */
   onFiles: (files: File[]) => void;
+  onReference: (file: File) => void;
+  referenceUpload: number | null;
   onSend: () => void; onStop: () => void;
 }) {
   const canSend = Boolean(value.trim()) && !running && !blocked && !uploading;
   const boxRef = useRef<View>(null);
   const pickRef = useRef<HTMLInputElement | null>(null);
+  const referenceRef = useRef<HTMLInputElement | null>(null);
   const filesRef = useRef(onFiles);
   filesRef.current = onFiles;
   // 粘贴挂在外层的 DOM 上：输入框里的 paste 会冒泡上来；有文件才接走。纯文字、从 Excel / Word 复制的字（顺带一张预览图）照常粘贴
@@ -1345,11 +1453,19 @@ function Composer({ value, onChange, running, waiting, sending, blocked, uploadi
     return () => node.removeEventListener("paste", onPaste);
   }, []);
   return <View ref={boxRef} {...ws("c-composer")} style={styles.composer}>
-    <Pressable {...ws("btn square")} accessibilityRole="button" accessibilityLabel="附图" onPress={() => pickRef.current?.click()} style={[styles.attachButton, webPointer]}>
+    <Pressable {...ws("btn square")} accessibilityRole="button" accessibilityLabel="添加图片、视频或音乐" onPress={() => pickRef.current?.click()} style={[styles.attachButton, webPointer]}>
       <ImagePlus size={16} color={color.textSecondary} />
     </Pressable>
-    {web ? <input ref={pickRef} type="file" multiple accept="image/*" style={{ display: "none" }}
+    {web ? <input ref={pickRef} type="file" multiple accept="image/*,video/*,audio/*,.mkv,.flac" style={{ display: "none" }}
       onChange={(event) => { const files = Array.from(event.currentTarget.files ?? []); event.currentTarget.value = ""; if (files.length) onFiles(files); }} /> : null}
+    {web ? <>
+      <Pressable {...ws('btn small')} accessibilityRole="button" accessibilityLabel="上传参考视频复刻" disabled={running || sending || blocked || uploading}
+        onPress={() => referenceRef.current?.click()} style={[webPointer, { padding: 5, opacity: running || sending || blocked || uploading ? .5 : 1 }]}>
+        <Text style={styles.linkText}>{referenceUpload !== null ? `上传 ${Math.round(referenceUpload * 100)}%` : '参考复刻'}</Text>
+      </Pressable>
+      <input ref={referenceRef} type="file" aria-label="参考视频文件" accept="video/*,.mkv" style={{ display: 'none' }}
+        onChange={e => { const file = e.currentTarget.files?.[0]; e.currentTarget.value = ''; if (file) onReference(file); }} />
+    </> : null}
     <TextInput
       accessibilityLabel="和 AI 说怎么剪"
       multiline
@@ -1363,7 +1479,7 @@ function Composer({ value, onChange, running, waiting, sending, blocked, uploadi
         event.preventDefault();
         if (canSend) onSend();
       }}
-      placeholder={waiting ?? (running ? "AI 正在剪，可以先想下一句" : uploading ? "图片还在传，传完就能发" : "说说想怎么剪（回车发送，能直接贴图）")}
+      placeholder={waiting ?? (running ? "AI 正在剪，可以先想下一句" : uploading ? "文件还在传，传完就能发" : "说说想怎么剪（可附参考视频）")}
       placeholderTextColor={color.textMuted}
       {...ws("c-input")}
       style={[styles.input, webAutoHeight]}

@@ -174,11 +174,11 @@ function withUse(next: AiEditGenerateConfig, stored: AiEditGenerateConfig, ai: A
 
 function videoInputNote(config: AiEditConfig, probe: { running: boolean; error?: string }): string {
   if (probe.running) return "正在测这个模型能不能直接看视频……";
-  const known = config.videoInput === true ? "这个模型能直接看视频，参考视频会整段发给它（画面和声音都能用上）。"
+  const known = config.videoInput === true ? "已测出支持视频画面；不代表已验证声音理解。复刻按实际输入策略分析，细节使用连续帧校准。"
     : config.videoInput === false ? "这个模型看不了视频。解析参考视频时，应用会先把视频拆成镜头截图和音乐节拍再交给它，这时要开着应用。"
       : null;
-  if (probe.error) return known ? `这次没测出来（${probe.error}），先沿用上次的结果：${known}` : `没测出这个模型能不能直接看视频（${probe.error}）。解析参考视频时会先整段发给它，看不了再拆成截图。`;
-  return known ?? "还没测过这个模型能不能直接看视频。";
+  if (probe.error) return known ? `这次没测出来（${probe.error}），先沿用上次的结果：${known}` : `没测出这个模型能不能直接看视频（${probe.error}）。复刻默认使用连续帧图片，检测失败不会被记成不支持。`;
+  return known ?? "还没测过视频输入。复刻默认使用连续帧图片和本地测量结果。";
 }
 
 function ModelPage({ connection, config, probe, onSave, onRetest }: Pick<AiEditSettingsProps, "connection" | "config" | "probe" | "onSave" | "onRetest">) {
@@ -357,7 +357,7 @@ function AnalysisRow({ connection, service, edit }: { connection: Connection | n
     ? isLocalAiRuntime(config.runtime) ? `已连接 · 用本机 ${RUNTIME_LABELS[config.runtime]}` : `已连接 •••• ${config.apiKey.trim().slice(-4)}`
     : aiConfigReady(edit) ? "没单独连 · 用剪辑模型" : null;
   const detail = connected && !isLocalAiRuntime(config.runtime) ? analysisInputNote(config, probe)
-    : "看懂视频：分段时间轴、转场、字幕和配乐卡点。最好用能直接看视频、听得到声音的模型，比如方舟 doubao-seed-2-1-lite。";
+    : "可选。不单独配置时由剪辑模型分析画面；至少一个模型需要能看图片。不支持视频时使用连续帧，解析失败会自动尝试剪辑模型。";
   return <View style={styles.row} testID="ai-provider-analysis">
     <View style={styles.rowHead}>
       <View style={styles.mark}><Text style={styles.markText}>解</Text></View>

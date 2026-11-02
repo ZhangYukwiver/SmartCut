@@ -9,6 +9,7 @@ import { animationEnums, members } from "./catalog.mjs";
 import { CURVE_Y_RANGE, MAX_SPEED_POINTS, SPEED_POINT_RANGE, curveSource, easeAt, seqOf, sliceSpeedCurve, splitCurve } from "./curves.mjs";
 import { EditError, invalid } from "./errors.mjs";
 import { renameRetrying } from "./rename.mjs";
+import { drawingProblem } from "./drawing.mjs";
 
 export const MAX_TIME_US = 24 * 60 * 60 * 1_000_000;
 const MAX_SRT_BYTES = 4 * 1024 * 1024;
@@ -292,6 +293,10 @@ const CurveSpeed = model([["name", str({ strip: true, min: 1, max: 20 }), "自�
   after: ({ points }) => (points[0].x === 0 && points.at(-1).x === 1 && points.every((point, i) => i === 0 || point.x > points[i - 1].x)
     ? null : "speed curve points must start at x=0, end at x=1 and keep increasing"),
 });
+const Drawing = (value, loc, errors) => {
+  const problem = drawingProblem(value);
+  return problem ? issue(errors, loc, "value_error", problem) : structuredClone(value);
+};
 
 const MediaSegmentCreate = model([
   ["path", MediaPath, REQUIRED],
@@ -304,6 +309,7 @@ const MediaSegmentCreate = model([
   ["transform", nullable(ClipTransform), null],
   ["crop", nullable(CropSettings), null],
   ["material_name", nullable(Label), null],
+  ["drawing", nullable(Drawing), null],
 ]);
 
 const TextBubbleOptions = model([["effect_id", Label, REQUIRED], ["resource_id", Label, REQUIRED]]);
@@ -342,6 +348,7 @@ const TextSegmentCreate = model([
 ]);
 
 const SegmentUpdate = model([
+  ["drawing", nullable(Drawing), null],
   ["timeline", nullable(TimeRange), null],
   ["source", nullable(TimeRange), null],
   ["volume", nullable(Volume), null],
@@ -930,11 +937,11 @@ export class ProjectStore {
   }
 
   /** 原仓库没有：撤销、退回时把存档里的整份工程写回（名字、画布、轨道、标记），revision 照常 +1。 */
-  async restoreProject(projectId, { name, canvas, tracks, markers } = {}) {
+  async restoreProject(projectId, { name, canvas, tracks, markers } = {}, { expectRevision } = {}) {
     const [body] = check([ProjectCreate, { name, canvas }]);
     if (!Array.isArray(tracks) || !Array.isArray(markers)) throw invalid("VALIDATION_ERROR", "Snapshot tracks and markers must be lists");
     return this.#serial(projectId, async () => {
-      const project = await this.#expected(projectId, null);
+      const project = await this.#expected(projectId, expectRevision ?? null);
       return this.#touch(project, { name: body.name, canvas: body.canvas, tracks: structuredClone(tracks), markers: structuredClone(markers) });
     });
   }
@@ -1007,6 +1014,7 @@ export class ProjectStore {
       const project = await this.#expected(projectId, params.expect_revision);
       const track = editableTrack(project, trackId);
       const info = await this.#probe(body.path);
+      if (body.drawing && info.kind === "audio") throw invalid("SEGMENT_FIELD_MISMATCH", "动画只支持图片或视频图层");
       if (info.kind === "audio" && track.track_type !== "audio") throw invalid("MEDIA_TRACK_MISMATCH", "Audio needs an audio track");
       if (info.kind !== "audio" && track.track_type !== "video") throw invalid("MEDIA_TRACK_MISMATCH", "Picture needs a video track");
       const source = body.source ?? timeRange({
@@ -1029,6 +1037,7 @@ export class ProjectStore {
         id: this.#segmentId(),
         kind: info.kind,
         path: info.path,
+        ...(body.drawing ? { drawing: body.drawing } : {}),
         timeline: body.timeline,
         source,
         volume: body.volume,
@@ -1162,10 +1171,11 @@ export class ProjectStore {
     if (!Object.keys(changes).length) return project;
     const kind = current.kind;
     const has = (...keys) => keys.some((key) => Object.hasOwn(changes, key));
-    const nullable = new Set(["transform", "bubble", "text_effect_id", "curve_speed"]);
+    const nullable = new Set(["transform", "bubble", "text_effect_id", "curve_speed", "drawing"]);
     if (Object.entries(changes).some(([key, value]) => value === null && !nullable.has(key))) {
       throw invalid("SEGMENT_UPDATE_INVALID", "Only transform may be cleared with null");
     }
+    if (has("drawing") && !["video", "image"].includes(kind)) throw invalid("SEGMENT_FIELD_MISMATCH", "动画只支持图片或视频图层");
     if (kind === "text") {
       if (has("source", "volume", "speed", "change_pitch", "fit", "path", "material_name")) {
         throw invalid("SEGMENT_FIELD_MISMATCH", "Text clips only accept timeline, text style and transform fields");
@@ -1267,6 +1277,11 @@ export class ProjectStore {
     if (curveChanged && updated.keyframes?.length && stretched !== 1) {
       updated.keyframes = updated.keyframes.map((item) => ({ ...item, offset_us: Math.min(updated.timeline.duration_us, Math.round(item.offset_us * stretched)) }));
     }
+    // 头部裁剪跟随原动画时间；挪动整段不改变段内节奏，换素材也不改变动画。
+    if (current.drawing && !has("drawing") && changes.timeline
+      && timeline.duration_us !== current.timeline.duration_us && timeline.start_us !== current.timeline.start_us) {
+      updated.drawing = { ...current.drawing, offset: (current.drawing.offset ?? 0) + (timeline.start_us - current.timeline.start_us) / 1e6 };
+    }
     for (const keyframe of updated.keyframes ?? []) {
       if (keyframe.offset_us > updated.timeline.duration_us) {
         throw invalid("KEYFRAME_OFFSET_INVALID", "Updated clip duration would move a keyframe outside the clip");
@@ -1339,6 +1354,7 @@ export class ProjectStore {
       second.id = this.#segmentId();
       first.timeline = { ...current.timeline, duration_us: offset };
       second.timeline = { ...current.timeline, start_us: current.timeline.start_us + offset, duration_us: duration - offset };
+      if (current.drawing) second.drawing = { ...current.drawing, offset: (current.drawing.offset ?? 0) + offset / 1e6 };
       if (current.source) {
         const source = current.source;
         // 曲线变速的切口按曲线找素材位置，两半各拿自己那一截曲线，倍速记各自的平均倍速

@@ -1,10 +1,17 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  DEFAULT_AI_EDIT_GENERATE_CONFIG, aiConfigReady, sameAiEditConfig, answerAiEditSpend, borrowArkKey, editAiEditClip, editAiEditClips, exportAiEditSession, generateConfigProblem, generationForRequest, getAiRuntimes, isArkUrl,
+  DEFAULT_AI_EDIT_GENERATE_CONFIG, aiConfigReady, aiEditLookUrl, sameAiEditConfig, answerAiEditSpend, borrowArkKey, editAiEditClip, editAiEditClips, exportAiEditSession, generateConfigProblem, generationForRequest, getAiRuntimes, isArkUrl,
   keepValidGenerateUrls, loadAiEditConfig, loadAiEditGenerateConfig, redoAiEdit, revertAiEdit, saveAiEditConfig, saveAiEditGenerateConfig, sendAiEditMessage, setAiEditGoal, undoAiEdit,
 } from "./aiEdit";
 
 afterEach(() => { vi.unstubAllGlobals(); });
+
+it('retains the render revision when authenticating a video review URL', () => {
+  const url = new URL(aiEditLookUrl('http://127.0.0.1:4865', '/v1/ai-edit/media/m/file?review=123', 'a+b'));
+  expect(url.searchParams.get('review')).toBe('123');
+  expect(url.searchParams.get('key')).toBe('a+b');
+  expect(new URL(aiEditLookUrl('http://127.0.0.1:4865', '/v1/ai-edit/media/m/file', 'key')).searchParams.get('key')).toBe('key');
+});
 
 describe("sendAiEditMessage", () => {
   it("sends only the AI edit settings, never the video analysis ones", async () => {

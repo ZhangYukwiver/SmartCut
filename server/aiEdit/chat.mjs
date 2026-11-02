@@ -35,8 +35,9 @@ export function parseEditConfig(value) {
   try { protocol = new URL(baseUrl).protocol; } catch { /* 下面统一报错 */ }
   if (protocol !== "https:" && protocol !== "http:") throw new AiEditError("invalid_config", "接口地址要以 https:// 开头。");
   if (!apiKey || !model) throw new AiEditError("invalid_config", "先在 AI 剪辑的接口设置里填好 Key 和模型。");
-  // 配置时测过能不能看视频（页面测完一起存）；没测过是 null，解析参考视频时先试整段视频
-  return { baseUrl, apiKey, model, videoInput: typeof value?.videoInput === "boolean" ? value.videoInput : null };
+  // 图片和视频能力分别记录；未验证时是未知，复刻默认使用图片路线。
+  return { baseUrl, apiKey, model, videoInput: typeof value?.videoInput === "boolean" ? value.videoInput : null,
+    ...(typeof value?.imageInput === 'boolean' ? { imageInput: value.imageInput } : {}) };
 }
 
 function isArk(baseUrl) {
@@ -184,7 +185,7 @@ const OMITTED = "较早的内容，细节已省略；还要用就用同样的参
 const OMITTED_ARGUMENTS = "较早的参数，细节已省略";
 // 这几个工具的结果后面还用得上（拆解结论、技能说明和命令输出）：压缩和本机 CLI 转述时都留开头这么多字
 export const KEEP_RESULT = {
-  analyze_reference: 6_000, read_skill: 6_000, run_skill_command: 2_000, skill_job: 1_500,
+  analyze_reference: 6_000, review_video_frames: 6_000, review_video_clip: 6_000, get_page_candidates: 6_000, preview_page: 6_000, inspect_image: 3_000, repair_image_regions: 3_000, read_skill: 6_000, run_skill_command: 2_000, skill_job: 1_500,
 };
 
 /** 长的工具结果只留成没成功和报错原因（KEEP_RESULT 里的工具再留开头），长的工具参数只留开头；短的不动（反复压也不会变）。 */

@@ -7,7 +7,7 @@ import { LOCAL_RUNTIMES, LocalAiError, isLocalRuntime, parseLocalConfig, runtime
 import { modelFetch } from "./systemProxy.mjs";
 
 // 解析库：拿 AI 剪辑素材库里的一条视频，整段连同拆解提示词发给用户自己配的 OpenAI 兼容接口
-// （默认火山方舟 doubao-seed-2-1-lite，能听音轨），答案存进数据目录的 analyses.json。
+// 答案存进数据目录的 analyses.json；视频画面能力与音轨理解能力分别判断。
 // 接口 Key 每次随请求带来、用完即丢，不落盘。
 
 export const ANALYSIS_PROMPT = `请从创作者角度拆解我提供的视频，目标是提炼可复用的创作方法，帮助我设计下一条内容。
@@ -188,7 +188,8 @@ export function parseAnalysisConfig(value) {
   if (protocol !== "https:" && protocol !== "http:") throw new AnalysisError("invalid_config", "接口地址要以 https:// 开头。");
   if (!apiKey || !model) throw new AnalysisError("invalid_config", "先在解析库的接口设置里填好 Key 和模型。");
   // videoInput：页面配置时测过模型能不能看视频；看不了就由开着的应用页面把视频拆成截图和节拍再给它
-  return { baseUrl, apiKey, model, direction: text(value?.direction, 600), videoInput: typeof value?.videoInput === "boolean" ? value.videoInput : null };
+  return { baseUrl, apiKey, model, direction: text(value?.direction, 600), videoInput: typeof value?.videoInput === "boolean" ? value.videoInput : null,
+    ...(typeof value?.imageInput === 'boolean' ? { imageInput: value.imageInput } : {}) };
 }
 
 /**
@@ -222,7 +223,7 @@ function providerError(status, body) {
   return Object.assign(new AnalysisError("provider_error", providerMessage(status, body, {
     413: "视频太大，接口收不下",
     524: "中转站等太久没等到回答（524），视频越长越慢，换个短一点的视频或反应快的模型再试",
-  }), 502), { transient: transientFailure(status, body) });
+  }), 502), { providerStatus: status, transient: transientFailure(status, body) });
 }
 
 // 远端中转站在回答流里回过「Upstream HTTP/2 stream failed」：它和上游之间断了，重发多半就好
@@ -266,13 +267,13 @@ export async function requestAnalysis(options) {
  * 本机 CLI 看截图：一次性、不带工具。不自动重发（重发白花订阅额度）。
  * localAi 是 server/localAi.mjs 的实例，由调用方带来。
  */
-async function localAnalysis({ config, video, parts, signal, localAi }) {
+async function localAnalysis({ config, video, parts, prompt, signal, localAi, onUsage, onModel }) {
   const label = LOCAL_RUNTIMES[config.runtime].label;
   if (!parts) throw new AnalysisError("video_unsupported", `${label} 看不了整段视频，要开着应用先拆成截图。`, 422);
   if (!localAi) throw new AnalysisError("local_runtime_unavailable", "本机 AI 没准备好，请重启应用。", 503);
   let markdown;
   try {
-    markdown = await localAi.ask(config.runtime, { model: config.model, parts, prompt: analysisPrompt(video, config.direction, config.focus), signal });
+    markdown = await localAi.ask(config.runtime, { model: config.model, parts, prompt: prompt ?? analysisPrompt(video, config.direction, config.focus), signal, onUsage, onModel });
   } catch (error) {
     if (error instanceof LocalAiError) throw new AnalysisError(error.code, error.message, error.status);
     throw error;
@@ -285,7 +286,8 @@ async function localAnalysis({ config, video, parts, signal, localAi }) {
  * parts：不发整段视频时换成别的内容（AI 剪辑给看不了视频的模型发截图和测出来的数字），提示词照旧接在最后。
  * prompt：换掉整份拆解提示词（AI 剪辑转写字幕用）。
  */
-async function analysis({ config, video, videoBase64, parts, prompt, signal, fetchImpl = modelFetch }) {
+async function analysis({ config, video, videoBase64, videoFps, parts, prompt, signal, fetchImpl = modelFetch, onUsage, onModel, reasoningEffort }) {
+  const imagesOnly = parts && !parts.some(part => part.type === 'video_url');
   const send = (effort) => fetchImpl(`${config.baseUrl}/chat/completions`, {
     method: "POST",
     signal,
@@ -299,7 +301,7 @@ async function analysis({ config, video, videoBase64, parts, prompt, signal, fet
       messages: [{
         role: "user",
         content: [
-          ...(parts ?? [{ type: "video_url", video_url: { url: `data:video/mp4;base64,${videoBase64}` } }]),
+          ...(parts ?? [{ type: "video_url", video_url: { url: `data:video/mp4;base64,${videoBase64}` }, ...(videoFps ? { fps: videoFps } : {}) }]),
           { type: "text", text: prompt ?? analysisPrompt(video, config.direction, config.focus) },
         ],
       }],
@@ -308,9 +310,11 @@ async function analysis({ config, video, videoBase64, parts, prompt, signal, fet
   // 截图版的镜头、节拍都是测好的，让推理模型少想一会儿：想太久，套着 Cloudflare 的中转站 100 秒没回第一个字就断（524）。
   // 不认这个参数的接口回 400/422，说法各家不一（OpenAI 点名参数，Ollama 说模型 does not support thinking），所以不看正文：
   // 去掉再发一次，真是别的错（比如图片太大）第二次照样报出来
-  let response = await send(parts ? "low" : null);
-  if (parts && (response.status === 400 || response.status === 422)) {
-    await response.text().catch(() => "");
+  const effort = reasoningEffort ?? (imagesOnly ? 'low' : null);
+  let response = await send(effort);
+  if (effort && (response.status === 400 || response.status === 422)) {
+    const body = await response.text().catch(() => "");
+    if ((!imagesOnly && videoRefused(response.status, body, { strict: true })) || /unauthori[sz]ed|authentication|invalid[_ -]?(?:api[_ -]?)?key|(?:api.?key|credential).*(?:invalid|incorrect|expired|missing)|insufficient.*(?:balance|quota|credit)|(?:quota|credit|balance).*(?:exceed|exhaust|insufficient)|exceed.*quota|余额不足|额度不足/iu.test(body)) throw providerError(response.status, body);
     response = await send(null);
   }
   if (!response.ok) throw providerError(response.status, await response.text().catch(() => ""));
@@ -322,6 +326,8 @@ async function analysis({ config, video, videoBase64, parts, prompt, signal, fet
     if (!body || typeof body !== "object") {
       throw new AnalysisError("provider_error", `接口回的内容看不懂（不是 JSON），检查一下接口地址是不是 OpenAI 兼容的地址（一般以 /v1 或 /api/v3 结尾）。这次请求的是 ${config.baseUrl}/chat/completions。`, 502);
     }
+    if (body.usage) onUsage?.(body.usage);
+    if (typeof body.model === 'string') onModel?.(body.model);
     if (body.error) throw providerError(0, JSON.stringify(body));
     const choice = body.choices?.[0];
     text = choice?.message?.content ?? "";
@@ -331,6 +337,8 @@ async function analysis({ config, video, videoBase64, parts, prompt, signal, fet
       if (data === "[DONE]") break;
       let chunk;
       try { chunk = JSON.parse(data); } catch { continue; }
+      if (chunk?.usage) onUsage?.(chunk.usage);
+      if (typeof chunk?.model === 'string') onModel?.(chunk.model);
       if (chunk?.error) throw providerError(0, JSON.stringify(chunk));
       const choice = chunk?.choices?.[0];
       text += choice?.delta?.content ?? "";
