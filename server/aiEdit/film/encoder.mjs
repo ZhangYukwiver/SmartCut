@@ -14,9 +14,10 @@ export const ENCODER_PAGE = `<!doctype html><meta charset="utf-8"><title>encoder
 ${MASTER_SOURCE}
 const b64 = (bytes) => new Promise((done) => { const reader = new FileReader(); reader.onload = () => done(String(reader.result).slice(String(reader.result).indexOf(',') + 1)); reader.readAsDataURL(new Blob([bytes])); });
 const bytesOf = async (chunk) => { const data = new Uint8Array(chunk.byteLength); chunk.copyTo(data); return b64(data); };
-// 某些系统 AAC 编码器把预滚样本也标为 timestamp=0。用独立脉冲测同一编码配置的延迟，不把测试声音写进成片。
+// 某些系统 AAC 编码器把预滚样本也标为 timestamp=0（macOS 的 Chrome 就是）。用独立脉冲测同一编码配置的延迟，不把测试声音写进成片。
+// 测不出来回 null，封装时按 AAC-LC 的常用值跳（mp4.mjs），不能当成没有预滚
 async function aacPriming(settings) {
-  if (typeof AudioDecoder === 'undefined') return 0;
+  if (typeof AudioDecoder === 'undefined') return null;
   const rate = settings.sampleRate, length = 14400, impulse = 2400;
   const chunks = []; let configuration, failure;
   const encoder = new AudioEncoder({ output(c, m) { chunks.push(c); if (m?.decoderConfig) configuration = m.decoderConfig; }, error(e) { failure = e; } });
@@ -39,7 +40,7 @@ async function aacPriming(settings) {
   try { decoder.configure(configuration); for (const chunk of chunks) decoder.decode(chunk); await decoder.flush(); if (failure) throw failure; }
   finally { decoder.close(); }
   const delay = index - impulse;
-  return peak > .05 && delay >= 0 && delay <= rate / 10 ? delay : 0;
+  return peak > .05 && delay > 0 && delay <= rate / 10 ? delay : null;
 }
 let video = null, out = [], config = null, failure = null, fps = 30, W = 0, H = 0;
 window.enc = {
@@ -133,8 +134,8 @@ window.enc = {
     encoder.close();
     if (broken) throw broken;
     // AAC 编码器可能先输出负时间戳的预滚样本（macOS 上常见 2112 样本）。封装时通过 edit list 跳过，不能当作 t=0 的声音。
-    const primingSamples = chunks[0]?.timestamp < 0 ? Math.round(-chunks[0].timestamp * rate / 1e6) : await aacPriming(settings).catch(() => 0);
-    return { sampleRate: rate, channels: 2, bitrate: 192000, primingSamples, presentationSamples: length,
+    const primingSamples = chunks[0]?.timestamp < 0 ? Math.round(-chunks[0].timestamp * rate / 1e6) : await aacPriming(settings).catch(() => null);
+    return { sampleRate: rate, channels: 2, bitrate: 192000, primingSamples,
       description: described ? await b64(described) : null, skipped: [...skipped], master,
       chunks: await Promise.all(chunks.map(async (c) => ({ data: await bytesOf(c), samples: Math.round((c.duration ?? 21333) * rate / 1e6) }))) };
   },

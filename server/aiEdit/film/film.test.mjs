@@ -56,17 +56,40 @@ describe("film", () => {
     for (let index = 0; index < 45; index += 1) await movie.writeVideo(Buffer.from([index, 1, 2, 3]), { duration: 1000 });
     await movie.close({ codec: "png ", width: 1080, height: 1920, timescale: 30_000, alpha: true });
     expect(await probeMedia(file, { roots: [dir] })).toMatchObject({ kind: "video", width: 1080, height: 1920, duration_us: 1_500_000, audio: false });
+  });
 
+  it("skips the AAC priming with an edit list and ends the sound with the picture", async () => {
+    const dir = await temp();
     const mp4 = path.join(dir, "film.mp4");
     const film = await openMovie(mp4);
     const avcC = Buffer.from([1, 0x64, 0, 0x28, 0xff, 0xe1, 0, 4, 0x67, 0x64, 0, 0x28, 1, 0, 2, 0x68, 0xce]);
     for (let index = 0; index < 60; index += 1) await film.writeVideo(Buffer.from([index]), { key: index % 30 === 0, duration: 1000 });
-    for (let index = 0; index < 94; index += 1) await film.writeAudio(Buffer.from([index]), 1024);
+    // 2 秒画面 + 2112 预滚 = 98112 个样本，97 帧 AAC 尾巴还多出一截
+    for (let index = 0; index < 97; index += 1) await film.writeAudio(Buffer.from([index]), 1024);
+    // 编码器没报预滚：按 AAC-LC 的 2112 跳
     await film.close({ codec: "avc1", width: 720, height: 1280, timescale: 30_000, description: avcC }, { sampleRate: 48_000, channels: 2, bitrate: 192_000, description: Buffer.from([0x11, 0x90]) });
-    const probed = await probeMedia(mp4, { roots: [dir] });
-    expect(probed).toMatchObject({ kind: "video", width: 720, height: 1280, audio: true });
-    // 94 帧 AAC 比画面多出半帧
-    expect(Math.abs(probed.duration_us - (94 * 1024 * 1e6) / 48_000)).toBeLessThan(2);
+    const bytes = await readFile(mp4);
+    const field = (type, offset, from = 0) => bytes.readUInt32BE(bytes.indexOf(type, from) + offset);
+    // 只有音轨有 elst：1 段，segment_duration 按 mvhd 的毫秒、等于画面；media_time 是 48 kHz 下的样本数；速率 1
+    const elst = bytes.indexOf("elst");
+    expect(bytes.indexOf("elst", elst + 4)).toBe(-1);
+    expect([8, 12, 16, 20].map((offset) => field("elst", offset))).toEqual([1, 2000, 2112, 0x10000]);
+    expect(field("mvhd", 20)).toBe(2000);
+    // 音轨带 AAC 的 roll -1（和 Apple、ffmpeg 写的一样），覆盖全部 97 帧：QuickTime 靠它才不在 elst 之外再扣一遍预滚
+    expect(bytes.subarray(bytes.indexOf("sgpd") + 4, bytes.indexOf("sbgp") - 4).toString("hex")).toBe("01000000726f6c6c0000000200000001ffff");
+    expect([12, 16, 20].map((offset) => field("sbgp", offset))).toEqual([1, 97, 1]);
+    // 两条 tkhd 的时长都是 2000 毫秒
+    expect([field("tkhd", 24), field("tkhd", 24, bytes.indexOf("tkhd") + 4)]).toEqual([2000, 2000]);
+    expect(await probeMedia(mp4, { roots: [dir] })).toMatchObject({ kind: "video", width: 720, height: 1280, audio: true, duration_us: 2_000_000 });
+
+    // 编码器报了就用它的
+    const reported = path.join(dir, "reported.mp4");
+    const again = await openMovie(reported);
+    await again.writeVideo(Buffer.from([0]), { duration: 1000 });
+    for (let index = 0; index < 3; index += 1) await again.writeAudio(Buffer.from([index]), 1024);
+    await again.close({ codec: "avc1", width: 720, height: 1280, timescale: 30_000, description: avcC }, { sampleRate: 48_000, channels: 2, bitrate: 192_000, description: Buffer.from([0x11, 0x90]), primingSamples: 1024 });
+    const other = await readFile(reported);
+    expect(other.readUInt32BE(other.indexOf("elst") + 16)).toBe(1024);
   });
 
   it("turns a place on the canvas into a film.html box and back", () => {

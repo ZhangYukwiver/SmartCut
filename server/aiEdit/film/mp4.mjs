@@ -59,7 +59,11 @@ function stts(durations) {
   return full("stts", 0, 0, u32(runs.length), runs.map(([count, duration]) => Buffer.concat([u32(count), u32(duration)])));
 }
 
-function sampleTable(track, entry) {
+// AAC 每帧要带上前一帧才解得对（roll -1，写法同 Apple 和 ffmpeg）。不写这条，QuickTime / AVFoundation 自己先扣一遍预滚，
+// 再按 elst 跳一遍，声音反而早 44 ms（11-03 实测）
+const roll = (count) => [full("sgpd", 1, 0, ascii("roll"), u32(2), u32(1), u16(0xffff)), full("sbgp", 0, 0, ascii("roll"), u32(1), u32(count), u32(1))];
+
+function sampleTable(track, entry, sound) {
   const large = track.offsets.some((offset) => offset > 0xffffffff);
   return box("stbl",
     full("stsd", 0, 0, u32(1), entry),
@@ -67,17 +71,23 @@ function sampleTable(track, entry) {
     track.keys && track.keys.length < track.sizes.length ? full("stss", 0, 0, u32(track.keys.length), track.keys.map((index) => u32(index + 1))) : [],
     full("stsc", 0, 0, u32(1), u32(1), u32(1), u32(1)),
     full("stsz", 0, 0, u32(0), u32(track.sizes.length), track.sizes.map(u32)),
-    large ? full("co64", 0, 0, u32(track.offsets.length), track.offsets.map(u64)) : full("stco", 0, 0, u32(track.offsets.length), track.offsets.map(u32)));
+    large ? full("co64", 0, 0, u32(track.offsets.length), track.offsets.map(u64)) : full("stco", 0, 0, u32(track.offsets.length), track.offsets.map(u32)),
+    sound ? roll(track.sizes.length) : []);
 }
 
 // MOV 的 hdlr 名字是带长度前缀的字符串，MP4 的是 \0 结尾
 const handler = (component, type, name, mov) => full("hdlr", 0, 0, component ? ascii(component) : u32(0), ascii(type), zeros(12),
   mov ? Buffer.concat([u8(name.length), ascii(name)]) : ascii(`${name}\0`));
 
-function trak({ id, track, entry, timescale, sound, width = 0, height = 0, mov, primingSamples = 0, presentationSamples }) {
+// AAC-LC 编码器开头的预滚样本（Apple AudioToolbox 的约定，48 kHz 下 44 ms）。编码器没报出来时按它跳：
+// 不跳的话这段静音被当成正片，声音整体比画面晚
+const AAC_PRIMING = 2112;
+
+// 音轨用 elst 跳过预滚、截到画面一样长（seconds 是画面时长），各家播放器解出来声画都从 0 起
+function trak({ id, track, entry, timescale, sound, width = 0, height = 0, mov, primingSamples = 0, seconds = Infinity }) {
   const media = track.durations.reduce((sum, value) => sum + value, 0);
   const priming = Math.min(media, Math.max(0, Math.round(primingSamples)));
-  const presented = Math.min(media - priming, presentationSamples ?? media - priming);
+  const presented = Math.min(media - priming, Math.round(seconds * timescale));
   const movie = Math.round((presented / timescale) * 1000);
   return box("trak",
     full("tkhd", 0, 3, u32(0), u32(0), u32(id), u32(0), u32(movie), zeros(8), u16(0), u16(sound ? 1 : 0), u16(sound ? 0x0100 : 0), u16(0), MATRIX,
@@ -90,7 +100,7 @@ function trak({ id, track, entry, timescale, sound, width = 0, height = 0, mov, 
         sound ? full("smhd", 0, 0, u16(0), u16(0)) : full("vmhd", 0, 1, zeros(8)),
         mov ? handler("dhlr", "url ", "DataHandler", mov) : [],
         box("dinf", full("dref", 0, 0, u32(1), full("url ", 0, 1))),
-        sampleTable(track, entry))));
+        sampleTable(track, entry, sound))));
 }
 
 /**
@@ -130,12 +140,12 @@ export async function openMovie(file, { container = "mp4" } = {}) {
     async close(videoConfig, audioConfig = null) {
       await queue;
       if (!video.sizes.length) throw new Error("影片里一帧都没有");
+      const seconds = video.durations.reduce((sum, value) => sum + value, 0) / videoConfig.timescale;
       const tracks = [trak({ id: 1, track: video, entry: visualEntry({ ...videoConfig, mov }), timescale: videoConfig.timescale, width: videoConfig.width, height: videoConfig.height, mov })];
       if (audioConfig && audio.sizes.length) {
         tracks.push(trak({ id: 2, track: audio, entry: audioEntry(audioConfig), timescale: audioConfig.sampleRate, sound: true, mov,
-          primingSamples: audioConfig.primingSamples, presentationSamples: audioConfig.presentationSamples }));
+          primingSamples: audioConfig.primingSamples ?? AAC_PRIMING, seconds }));
       }
-      const seconds = video.durations.reduce((sum, value) => sum + value, 0) / videoConfig.timescale;
       const mvhd = full("mvhd", 0, 0, u32(0), u32(0), u32(1000), u32(Math.round(seconds * 1000)), u32(0x00010000), u16(0x0100), zeros(10), MATRIX, zeros(24), u32(tracks.length + 1));
       const moov = box("moov", mvhd, ...tracks);
       await handle.write(moov, 0, moov.length, position);
