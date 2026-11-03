@@ -350,6 +350,27 @@ describe("film", () => {
       server.close();
     }
   });
+
+  it("tells the timeline how long a clip video's frames last, only for files under its key", async () => {
+    const root = await temp();
+    await mkdir(path.join(root, "media"));
+    await writeFile(path.join(root, "media", "v.mp4"), await readFile(new URL("../probe-video.mp4", import.meta.url)));
+    await writeFile(path.join(root, "secret.mp4"), await readFile(new URL("../probe-video.mp4", import.meta.url)));
+    const files = createFilmFiles({ root });
+    const server = http.createServer(async (request, response) => {
+      if (!(await files.handle(request, response, new URL(request.url, "http://x")))) response.writeHead(418).end();
+    }).listen(0, "127.0.0.1");
+    await new Promise((done) => server.once("listening", done));
+    const origin = `http://127.0.0.1:${server.address().port}`;
+    const said = async (of) => (await fetch(`${files.urlFor(origin, "renders/x/__film/frame-duration")}?of=${encodeURIComponent(of)}`)).json();
+    try {
+      expect(await said(new URL(files.urlFor(origin, "media/v.mp4")).pathname)).toEqual({ seconds: 0.1 });
+      expect(await said(`/v1/ai-edit/film/${files.key}/media/..%2Fsecret.mp4`)).toEqual({ seconds: null });
+      expect(await said(`/v1/ai-edit/film/other/media/v.mp4`)).toEqual({ seconds: null });
+    } finally {
+      server.close();
+    }
+  });
 });
 
 function round3(value) { return Math.round(value * 1000) / 1000; }
