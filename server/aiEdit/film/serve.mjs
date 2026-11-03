@@ -4,6 +4,7 @@ import { readFile, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import { pipeline } from "node:stream/promises";
 
+import { videoFrameSeconds } from "../media.mjs";
 import { ENCODER_PAGE } from "./encoder.mjs";
 import { BRIDGE, HOST_FLAG, encoderCsp, filmPlace, filmStart, holdPages, injectFirst, pageCsp } from "./host.mjs";
 import { DEFAULT_STAGE, FILM_FILE, readFilmFile } from "./vendor/film-doc.mjs";
@@ -33,6 +34,19 @@ export function createFilmFiles({ root }) {
     const actual = Buffer.from(given);
     return actual.length === expected.length && timingSafeEqual(actual, expected);
   };
+  const relOf = (encoded) => {
+    try {
+      const rel = decodeURIComponent(encoded);
+      return rel.includes("\\") || rel.includes("\0") ? null : rel;
+    } catch { return null; }
+  };
+  // 区里的真实文件；链接出去的不跟（导入的工程可能带着指向别处的链接）
+  const ownFile = async (rel) => {
+    if (!AREAS.has(rel.split("/")[0])) return null;
+    realRoot ??= await realpath(root);
+    const file = await realpath(path.normalize(path.join(realRoot, rel))).catch(() => null);
+    return file && within(path.join(realRoot, rel.split("/")[0]), file) ? file : null;
+  };
 
   return {
     key,
@@ -50,9 +64,8 @@ export function createFilmFiles({ root }) {
       const notFound = () => { response.writeHead(404, { ...headers, "Content-Type": "text/plain; charset=utf-8" }).end("not found"); };
       if (request.method !== "GET" && request.method !== "HEAD") { response.writeHead(405, headers).end(); return true; }
       if (!keyMatches(match[1])) { notFound(); return true; }
-      let rel;
-      try { rel = decodeURIComponent(match[2]); } catch { notFound(); return true; }
-      if (rel.includes("\\") || rel.includes("\0")) { notFound(); return true; }
+      const rel = relOf(match[2]);
+      if (rel == null) { notFound(); return true; }
       if (rel === "__encoder.html") {
         response.writeHead(200, { ...headers, "Content-Type": "text/html; charset=utf-8", "Content-Security-Policy": encoderCsp(place) }).end(ENCODER_PAGE);
         return true;
@@ -62,19 +75,22 @@ export function createFilmFiles({ root }) {
       if (vendor) {
         if (VENDOR.has(vendor[1])) {
           response.writeHead(200, { ...headers, "Content-Type": "text/javascript; charset=utf-8" }).end(await readFile(VENDOR.get(vendor[1])));
-        } else if (vendor[1] === "frame-duration" || vendor[1] === "media-facts") {
-          // 这两个 openfilm 靠 ffprobe 答，我们没有：答「不知道」，timeline 自己按浏览器读到的算
-          response.writeHead(200, { ...headers, "Content-Type": "application/json" }).end(vendor[1] === "frame-duration" ? JSON.stringify({ seconds: null }) : "null");
+        } else if (vendor[1] === "frame-duration") {
+          // 片段视频一帧多长（openfilm 用 ffprobe，我们读 mp4 / mov 的头）。timeline 靠它认 seek 后刚上屏的那一帧；答不知道时它按
+          // 「离 t 近还是离原处近」猜，帧回调比 seeked 先到就常猜错，白等 1 秒重跳（24 fps 素材进 30 fps 成片约一半的帧这样）
+          const of = url.searchParams.get("of") ?? "";
+          const asked = of.startsWith(base) ? relOf(of.slice(base.length)) : null;
+          const file = asked == null ? null : await ownFile(asked);
+          const seconds = file ? await videoFrameSeconds(file).catch(() => null) : null;
+          response.writeHead(200, { ...headers, "Content-Type": "application/json" }).end(JSON.stringify({ seconds }));
+        } else if (vendor[1] === "media-facts") {
+          // openfilm 靠 ffprobe 答，我们没有：答「不知道」，timeline 自己按浏览器读到的算
+          response.writeHead(200, { ...headers, "Content-Type": "application/json" }).end("null");
         } else notFound();
         return true;
       }
-      if (!AREAS.has(rel.split("/")[0])) { notFound(); return true; }
-      realRoot ??= await realpath(root);
-      const asked = path.normalize(path.join(realRoot, rel));
-      let file;
-      try { file = await realpath(asked); } catch { notFound(); return true; }
-      // 链接出去的不跟（导入的工程可能带着指向别处的链接）
-      if (!within(path.join(realRoot, rel.split("/")[0]), file)) { notFound(); return true; }
+      const file = await ownFile(rel);
+      if (!file) { notFound(); return true; }
       let info;
       try { info = await stat(file); } catch { notFound(); return true; }
       if (info.isDirectory()) { notFound(); return true; }

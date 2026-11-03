@@ -120,6 +120,15 @@ export async function probeMedia(raw, options = {}) {
   };
 }
 
+/**
+ * 视频一帧多长（秒）：mp4 / mov 按 stts 取平均（ffprobe 的 avg_frame_rate 倒过来）；别的格式、分片 mp4、读不出来回 null。
+ * 出片时 timeline 的 __film/frame-duration 要它（serve.mjs），靠它认出刚上屏的那一帧。
+ */
+export async function videoFrameSeconds(filePath) {
+  const { streams } = await parseFile(filePath, PROBE_TIMEOUT_MS);
+  return streams.find((item) => item.type === "video")?.frameSeconds ?? null;
+}
+
 // ---------------------------------------------------------------------------
 // 路径工具（对应 pathlib 的 suffix / expanduser / is_absolute / resolve / is_relative_to）
 
@@ -1021,6 +1030,9 @@ function finishTrack(track) {
     timeBase: [1, track.timescale],
     start,
     duration: track.duration,
+    // 一帧平均多长（秒）：stts 总长 ÷ 样本数，videoFrameSeconds 用
+    frameSeconds: track.type === "video" && track.sampleCount > 0 && track.sttsDuration > 0n
+      ? Number(track.sttsDuration) / track.sampleCount / track.timescale : null,
   };
 }
 
