@@ -4,9 +4,11 @@ import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import http from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import vm from "node:vm";
 import { unzipSync } from "fflate";
 import { describe, expect, it } from "vitest";
 
+import { layerStyle } from "../clipLook.mjs";
 import { probeMedia } from "../media.mjs";
 import { boxOf, filmToPlan, projectToFilm, transformOf } from "./filmFile.mjs";
 import { openMovie } from "./mp4.mjs";
@@ -118,6 +120,81 @@ describe("film", () => {
     expect(plan.tracks[1].clips[0]).toMatchObject({ kind: "sound", volume: 0 });
     expect(plan.tracks[2].clips[0]).toMatchObject({ kind: "page", at: 1, time: [0, 2], fade: [0.3, 0] });
     expect(plan.tracks[3].clips[0]).toMatchObject({ kind: "page", file: path.join(dir, "text/s4.html") });
+  });
+
+  it("draws masks, keyframes and filters in pages that run the preview's own layerStyle each frame", async () => {
+    const media = new Map([
+      ["/m/a.mp4", { name: "彩虹.mp4", width: 960, height: 1280, source: { type: "local" } }],
+      ["/m/p.mov", { name: "页", width: 1080, height: 1920, source: { type: "page", page: "abc/index.html" } }],
+    ]);
+    const clip = (id, extra) => ({ id, kind: "video", path: "/m/a.mp4", timeline: { start_us: 0, duration_us: 3e6 }, source: { start_us: 1e6, duration_us: 3e6 }, fit: "cover", volume: 1, ...extra });
+    // 彩虹渐染：下层饱和度 -1 → 0（音量也有关键帧），上层矩形蒙版羽化 65、不透明度 0 → 1，再加一个滤镜
+    const low = clip("low", { keyframes: [
+      { property: "saturation", offset_us: 0, value: -1 }, { property: "saturation", offset_us: 15e5, value: -1, curve: [0.42, 0, 0.58, 1] }, { property: "saturation", offset_us: 3e6, value: 0 },
+      { property: "volume", offset_us: 0, value: 0 }, { property: "volume", offset_us: 1e6, value: 0.8 },
+    ] });
+    const sky = clip("sky", { volume: 0, mask: { mask_type: "矩形", center_x: 0, center_y: 280, size: 0.58, rotation: 0, feather: 65, invert: false, rect_width: 1 },
+      keyframes: [{ property: "alpha", offset_us: 0, value: 0, curve: [0.42, 0, 0.58, 1] }, { property: "alpha", offset_us: 15e5, value: 1 }], filters: [{ filter_type: "黑白", intensity: 50 }] });
+    const title = { id: "title", kind: "text", text: "彩虹", timeline: { start_us: 0, duration_us: 1e6 }, keyframes: [{ property: "alpha", offset_us: 0, value: 0 }, { property: "alpha", offset_us: 5e5, value: 1 }] };
+    const project = { canvas: { width: 1080, height: 1920, fps: 30 }, tracks: [
+      { track_type: "video", segments: [low] },
+      { track_type: "video", segments: [sky] },
+      // 爱心蒙版预览也不画、网页片段的蒙版画不进去：照旧算没带过去
+      { track_type: "video", segments: [clip("heart", { mask: { mask_type: "爱心" } }), clip("page", { path: "/m/p.mov", timeline: { start_us: 3e6, duration_us: 1e6 }, mask: { mask_type: "圆形" } })] },
+      { track_type: "text", segments: [title] },
+    ] };
+    const { html, texts, dropped, volumes } = projectToFilm(project, {
+      mediaOf: (filePath) => media.get(filePath), srcFor: (item) => `assets/${item.name}`, pageSrc: (rel) => `pages/${rel}`, textSrc: (seg) => `text/${seg.id}.html`,
+    });
+    expect(dropped).toEqual({ 蒙版: 2 });
+    expect(html).toContain('<iframe id="sky" src="text/sky.html#t=0,3"></iframe>');
+    expect(html).toContain('<iframe id="low" src="text/low.html#t=0,3"></iframe>');
+    // 画面在小网页里，声音另起一个同样截取的声音片段（音量写最响的那一下，逐点的交给混音）；静音的上层不出声
+    expect(html).toContain('<audio id="low-audio" src="assets/彩虹.mp4#t=1,4" volume="0.8"></audio>');
+    expect(html).not.toContain("sky-audio");
+    expect(html).toContain('<video id="heart"');
+    expect(Object.keys(volumes)).toEqual(["low-audio"]);
+
+    // 小网页的脚本放进假的 DOM 里跑：每一帧素材的样式就是看板预览 layerStyle 算的那一份
+    const run = (page, element) => {
+      const listeners = {};
+      let time = 0;
+      Object.assign(element, { style: {}, addEventListener: (type, listener) => { listeners[type] = listener; }, requestVideoFrameCallback: (callback) => setTimeout(callback, 0) });
+      Object.defineProperties(element, {
+        src: { set: () => setTimeout(() => (listeners.loadeddata ?? listeners.load)?.(), 0) },
+        currentTime: { get: () => time, set: (value) => { time = value; setTimeout(() => listeners.seeked?.(), 0); } },
+      });
+      const context = { window: {}, document: { querySelector: () => element }, setTimeout, clearTimeout };
+      vm.runInNewContext(page.html.match(/<script>([\s\S]*)<\/script>/u)[1], context);
+      return context.window.film;
+    };
+    const px = (css) => Object.fromEntries(Object.entries(css).map(([key, value]) => [key, typeof value === "number" && key !== "opacity" ? `${value}px` : value ?? ""]));
+    const stage = { width: 1080, height: 1920 };
+    for (const [segment, t] of [[sky, 0.75], [sky, 2], [low, 0.4], [low, 2.25]]) {
+      const element = { videoWidth: 960, videoHeight: 1280, duration: 4.833 };
+      const film = run(texts.find((page) => page.src === `text/${segment.id}.html`), element);
+      await film.ready;
+      await film.frame(t);
+      expect(element.currentTime).toBeCloseTo(1 + t, 9);
+      expect(element.style).toEqual(px(layerStyle(stage, segment, { width: 960, height: 1280 }, t * 1e6).css));
+    }
+    const skyAt = (t) => { const element = { videoWidth: 960, videoHeight: 1280, duration: 4.833 }; const film = run(texts.find((page) => page.src === "text/sky.html"), element); return film.ready.then(() => film.frame(t)).then(() => element.style); };
+    expect((await skyAt(0.75)).opacity).toBeCloseTo(0.5, 6);
+    expect((await skyAt(0.75)).maskImage).toMatch(/^url\("data:image\/svg\+xml,.*feGaussianBlur/u);
+    expect((await skyAt(0.75)).filter).toBe("grayscale(0.5)");
+    const lowStyle = { videoWidth: 960, videoHeight: 1280, duration: 4.833 };
+    const lowFilm = run(texts.find((page) => page.src === "text/low.html"), lowStyle);
+    await lowFilm.ready;
+    await lowFilm.frame(0.4);
+    expect(lowStyle.style.filter).toBe("saturate(0)");
+    await lowFilm.frame(3);
+    expect(lowStyle.style.filter).toBe("");
+
+    // 文字的关键帧也在网页里按同一份 effectiveTransform 走
+    const p = {};
+    const titleFilm = run(texts.find((page) => page.src === "text/title.html"), p);
+    titleFilm.frame(0.25);
+    expect(p.style.opacity).toBe("0.5");
   });
 
   it("keeps back-to-back clips touching and file trims inside the file after rounding to ms", () => {

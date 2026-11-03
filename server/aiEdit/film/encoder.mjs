@@ -95,9 +95,13 @@ window.enc = {
         const gain = context.createGain();
         const span = (to - from) / speed;
         const [fadeIn, fadeOut] = Array.isArray(s.fade) ? s.fade : [0, 0];
-        gain.gain.setValueAtTime(fadeIn > 0 ? 0 : volume, at);
-        if (fadeIn > 0) gain.gain.linearRampToValueAtTime(volume, at + fadeIn);
-        if (fadeOut > 0) { gain.gain.setValueAtTime(volume, Math.max(at, at + span - fadeOut)); gain.gain.linearRampToValueAtTime(0, at + span); }
+        // gain：音量关键帧连同淡入淡出逐点算好的音量，铺满这一段
+        if (s.gain?.length >= 2) gain.gain.setValueCurveAtTime(Float32Array.from(s.gain), at, span);
+        else {
+          gain.gain.setValueAtTime(fadeIn > 0 ? 0 : volume, at);
+          if (fadeIn > 0) gain.gain.linearRampToValueAtTime(volume, at + fadeIn);
+          if (fadeOut > 0) { gain.gain.setValueAtTime(volume, Math.max(at, at + span - fadeOut)); gain.gain.linearRampToValueAtTime(0, at + span); }
+        }
         node.connect(gain).connect(context.destination);
         node.start(at, from, to - from);
       }
@@ -145,7 +149,7 @@ const FRAMES_PER_KEY = 2; // 秒
 
 /**
  * 一路视频（+ 混音）编进 MP4。frames(i) 按顺序给第 i 帧的 JPEG；sounds 是 film.html 的声音片段（timeline 的 __filmSounds），
- * 可以带 role（voice 旁白 / duck 给旁白让位）。loudness 是成片响度（LUFS，null 不处理），bitsPerPixel 定码率。
+ * 可以带 role（voice 旁白 / duck 给旁白让位）和 gain（这一段从头到尾均匀取点的音量，代替 volume 和淡入淡出）。loudness 是成片响度（LUFS，null 不处理），bitsPerPixel 定码率。
  * encoderTab 是 openTab 打开的编码页。回音频里没解出声音的文件和母带处理的结果（{ before, after, peak }）。
  */
 export async function encodeMp4({ encoderTab, file, width, height, fps, count, frame, sounds = [], loudness = null, bitsPerPixel = QUALITY_BITS.high, onProgress = () => undefined, signal }) {

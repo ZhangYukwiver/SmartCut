@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import type { EditMediaSegment, EditProject, EditSegment, EditTextSegment, EditTrack } from "../../services/aiEdit";
 import {
   activeFrame, blendMode, clipDetail, clipExtras, colorName, cutPoints, draftBoxReasonText, clipLabel, clipPosition, colorFilter, cropClipPath, cssTransform, effectiveTransform, fadeGain,
-  featureLook, featureName, featurePreviewRange, filmstripCount, filmstripTimes, findSegment, fitBox, formatClock, formatDuration, formatTick, hasScaleKeyframes, IDENTITY_TRANSFORM, keyframeValue, layerBox, layerRect, maskCss, mediaIdFromPath,
+  featureLook, featureName, featurePreviewRange, filmstripCount, filmstripTimes, findSegment, fitBox, formatClock, formatDuration, formatTick, hasScaleKeyframes, IDENTITY_TRANSFORM, keyframeValue, layerBox, layerRect, layerStyle, maskCss, mediaIdFromPath,
   mediaThumbView, mediaVolume, nextCut, nextSegmentAfter, overlayFilter, pickTickStep, playbackRate, projectDuration, rgba, rulerTicks, secondMark, segmentAt, sourceTimeUs, speedAtUs, spokenDuration, textCss,
   stepFrame, textFontPx, timeAtX, trackLabel, transitionReach, visibleExportNote,
 } from "./aiEditModel";
@@ -450,8 +450,13 @@ describe("剪映效果的近似样子", () => {
   });
 
   it("tints by the filter's name and strength, and approximates only the effects it can", () => {
-    expect(featureLook(media("a", 0, S, { filters: [{ filter_type: "黑白", intensity: 50 }] }), 0).filter).toBe("grayscale(0.5)");
-    expect(featureLook(media("a", 0, S, { filters: [{ filter_type: "清新" }] }), 0).filter).not.toBe("");
+    // 片段滤镜在 layerStyle 里（出片同一份），排在亮度 / 对比度 / 饱和度关键帧后面；featureLook 只管剪映画的特效、动画、转场
+    const stage = { width: 108, height: 192 };
+    const graded = media("a", 0, S, { filters: [{ filter_type: "黑白", intensity: 50 }], keyframes: [{ property: "saturation", offset_us: 0, value: -0.5 }] });
+    expect(layerStyle(stage, graded, null, 0).css.filter).toBe("saturate(0.5) grayscale(0.5)");
+    expect(featureLook(graded, 0).filter).toBe("");
+    expect(layerStyle(stage, media("a", 0, S, { filters: [{ filter_type: "清新" }] }), null, 0).css.filter).toBeTruthy();
+    expect(layerStyle(stage, media("a", 0, S), null, 0).css.filter).toBeUndefined();
     expect(featureLook(media("a", 0, S, { effects: [{ effect_type: "模糊" }] }), 0).filter).toBe("blur(6px)");
     expect(featureLook(media("a", 0, S, { effects: [{ effect_type: "爱心" }] }), 0).filter).toBe("");
     const filter = { id: "f", kind: "track_filter", filter_type: "复古", intensity: 100, timeline: { start_us: 0, duration_us: S } } as EditSegment;
