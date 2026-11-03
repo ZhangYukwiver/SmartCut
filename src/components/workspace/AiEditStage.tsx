@@ -3,9 +3,8 @@ import { Pressable, StyleSheet, Text, View, type LayoutChangeEvent } from "react
 import { Pause, Play, Quote, RotateCcw, Scissors, SquareDashed, Sticker, Trash2, Type } from "lucide-react-native";
 import { pageOf, type AiEditMediaItem, type EditCanvas, type EditMediaSegment, type EditSegment, type EditTextSegment, type EditTrack, type EditTransform } from "../../services/aiEdit";
 import {
-  activeFrame, blendMode, clipLabel, colorFilter, cropClipPath, cssTransform, effectiveTransform, featureLook, featureName, findSegment, formatClock, hasScaleKeyframes,
-  layerBox, layerRect, maskCss, mediaIdFromPath, mediaVolume, nextSegmentAfter, overlayFilter, playbackRate, rgba, sourceTimeUs, speedAtUs, textCss, US_PER_SECOND,
-  type MaskSpec, type Size,
+  activeFrame, blendMode, clipLabel, cssTransform, effectiveTransform, featureLook, featureName, findSegment, formatClock, layerBox, layerRect, layerStyle,
+  mediaIdFromPath, mediaVolume, nextSegmentAfter, overlayFilter, playbackRate, rgba, sourceTimeUs, speedAtUs, textCss, US_PER_SECOND, type Size,
 } from "./aiEditModel";
 import { dragRect, fullTransform, layersInRect, regionBox, SNAP_PX, splitOffset, type Rect } from "./aiEditBoardEdit";
 import {
@@ -927,26 +926,19 @@ function Layer({ layer, active, canvas, stage, time, playing, mediaById, mediaUr
   if (segment.kind !== "video" && segment.kind !== "image" && segment.kind !== "audio") return null;
   if (segment.kind === "audio") return url ? <MediaElement kind="audio" url={url} segment={segment} track={track} time={time} playing={playing} active={active} style={{ display: "none" }} /> : null;
 
-  const transform = effectiveTransform(segment, offset);
-  const fit = segment.fit ?? "contain";
   // 有地址时只信元素读到的尺寸；没读到之前框按画布比例、让浏览器按 fit 自己摆，不拉伸。
   // 素材还没就绪时只画占位框，素材库的宽高够用
   const material = url ? natural : item?.width && item.height ? { width: item.width, height: item.height } : null;
-  const box = segment.drawing ? stage : layerBox(stage, material, fit, segment.keyframes);
-  const rect = layerRect(stage, box, transform);
-  const mask = maskCss(segment.mask as MaskSpec | null | undefined, { width: rect.width, height: rect.height }, material);
-  // 剪映的转场、动画、滤镜、特效：近似画出来（看得出加上了），以剪映为准
+  // 摆放、关键帧、蒙版、裁剪和滤镜和出片是同一份（layerStyle）
+  const { rect, css } = layerStyle(stage, segment, material, offset, segment.drawing ? stage : undefined);
+  // 剪映的转场、动画、特效：近似画出来（看得出加上了），以剪映为准
   const look = featureLook(segment, offset, track.segments);
-  const turned = cssTransform(rect);
   const style: React.CSSProperties = {
-    position: "absolute", left: rect.left, top: rect.top, width: rect.width, height: rect.height,
-    objectFit: material || (fit === "stretch" && !hasScaleKeyframes(segment.keyframes)) ? "fill" : fit === "cover" && !hasScaleKeyframes(segment.keyframes) ? "cover" : "contain",
-    transform: [look.transform, turned === "none" ? "" : turned].filter(Boolean).join(" ") || "none", opacity: active ? rect.opacity * look.opacity : 0,
-    filter: [colorFilter(segment.keyframes, offset), look.filter].filter(Boolean).join(" ") || undefined,
+    ...(css as React.CSSProperties),
+    transform: [look.transform, css.transform === "none" ? "" : css.transform].filter(Boolean).join(" ") || "none", opacity: active ? rect.opacity * look.opacity : 0,
+    filter: [css.filter, look.filter].filter(Boolean).join(" ") || undefined,
     mixBlendMode: (blendMode(segment.mix_mode?.mode) ?? undefined) as React.CSSProperties["mixBlendMode"],
-    clipPath: cropClipPath(segment.crop) ?? undefined,
     pointerEvents: "none",
-    ...(mask as React.CSSProperties | null),
   };
   const fill = active && segment.background_filling ? <div style={{ position: "absolute", inset: 0, backgroundColor: segment.background_filling.fill_type === "color" ? rgba(segment.background_filling.color ?? "#000000") : color.black, overflow: "hidden" }}>
     {segment.background_filling.fill_type === "blur" && segment.kind === "image" && url ? <img src={url} alt="" style={{ width: "100%", height: "100%", objectFit: "cover", filter: `blur(${Math.round(4 + (segment.background_filling.blur ?? 0.0625) * 60)}px)`, transform: "scale(1.1)" }} /> : null}

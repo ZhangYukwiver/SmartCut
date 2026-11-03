@@ -73,6 +73,6 @@ it('composites the unchanged base video with a temporary overlay at the timeline
   project.tracks[1].segments.push({ ...project.tracks[1].segments[0], id: 'other-mask' });
   await expect(clips.composition(args)).rejects.toMatchObject({ code: 'review_composition_required' });
   expect(await clips.composition({ ...args, clipId: 'mask-clip' })).toBeTruthy();
-  project.tracks[0].segments[0].filters = ['unsupported'];
+  project.tracks[0].segments[0].effects = [{ effect_type: 'unsupported' }];
   await expect(clips.composition({ ...args, clipId: 'mask-clip' })).rejects.toMatchObject({ code: 'review_composition_unsupported' });
 });

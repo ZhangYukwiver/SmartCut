@@ -9,6 +9,7 @@ import { Unzip, UnzipInflate, Zip, ZipDeflate, ZipPassThrough } from "fflate";
 import { AiEditError } from "../library.mjs";
 import { openTab } from "./browser.mjs";
 import { QUALITY_BITS, encodeMp4 } from "./encoder.mjs";
+import { volumeAt } from "../clipLook.mjs";
 import { FILM_FILE, droppedText, filmToPlan, projectToFilm, transformOf } from "./filmFile.mjs";
 import { createPages } from "./pages.mjs";
 import { createReviewClips } from './reviewClips.mjs';
@@ -65,7 +66,9 @@ export function createFilmStudio({ root, library, provider, getOrigin }) {
         pageFiles.add(rel);
         return `pages/${rel}`;
       };
-      const { html, texts, dropped } = projectToFilm(project, { mediaOf, srcFor, pageSrc, textSrc: (segment) => `text/${segment.id}.html` });
+      const { html, texts, dropped, volumes } = projectToFilm(project, { mediaOf, srcFor, pageSrc, textSrc: (segment) => `text/${segment.id}.html` });
+      const keyed = Object.keys(volumes).length;
+      if (keyed) dropped["音量关键帧"] = keyed;
       // 页面引用的共用文件夹也带上，放在包里同样的相对位置（已经整个带上的文件夹里的不重复带）
       for (const rel of pageFiles) {
         const page = await readFile(path.join(pages.directory, rel), "utf8").catch(() => "");
@@ -291,7 +294,7 @@ export function createFilmStudio({ root, library, provider, getOrigin }) {
       const folder = path.join(renders, sessionId);
       await rm(folder, { recursive: true, force: true });
       await mkdir(path.join(folder, "text"), { recursive: true, mode: 0o700 });
-      const { html, texts, dropped } = projectToFilm(project, {
+      const { html, texts, dropped, volumes } = projectToFilm(project, {
         mediaOf,
         srcFor: (_item, filePath) => `../../media/${path.basename(filePath)}`,
         pageSrc: (rel) => `../../pages/${rel}`,
@@ -308,15 +311,22 @@ export function createFilmStudio({ root, library, provider, getOrigin }) {
       try {
         encoder = await openTab(provider, files.urlFor(origin, "__encoder.html"), { plain: true });
         const count = Math.max(1, Math.round(duration * fps));
-        // 声音片段（clip 是片段 id）按所在轨道标上旁白 / 让位：旁白轨不跟着自己让位
+        // 声音片段（clip 是片段 id，画面画在小网页里的是「id-audio」）按所在轨道标上旁白 / 让位：旁白轨不跟着自己让位
         const roles = new Map(project.tracks.flatMap((track) => {
           const role = track.narration ? "voice" : track.duck ? "duck" : null;
-          return role ? (track.segments ?? []).map((segment) => [segment.id, role]) : [];
+          return role ? (track.segments ?? []).flatMap((segment) => [[segment.id, role], [`${segment.id}-audio`, role]]) : [];
         }));
+        // 音量关键帧（连同淡入淡出）每 10 毫秒取一个点，混音时照着走
+        const gainOf = (segment) => {
+          const count = Math.max(2, Math.ceil(segment.timeline.duration_us / 10_000) + 1);
+          return Array.from({ length: count }, (_, index) => Math.round(volumeAt(segment, (index / (count - 1)) * segment.timeline.duration_us) * 1e4) / 1e4);
+        };
         const result = await encodeMp4({
           encoderTab: encoder, file, width, height, fps, count, signal,
           frame: async (index) => { await film.seek(index / fps); return film.capture({ format: "jpeg", quality: 90 }); },
-          sounds: film.meta.sounds.map((sound) => (roles.has(sound.clip) ? { ...sound, role: roles.get(sound.clip) } : sound)),
+          sounds: film.meta.sounds.map((sound) => ({
+            ...sound, ...(roles.has(sound.clip) ? { role: roles.get(sound.clip) } : {}), ...(volumes[sound.clip] ? { gain: gainOf(volumes[sound.clip]) } : {}),
+          })),
           loudness: project.canvas.loudness ?? null,
           bitsPerPixel: QUALITY_BITS[project.canvas.quality] ?? QUALITY_BITS.standard,
           onProgress: (share) => onProgress(share * 0.95),
