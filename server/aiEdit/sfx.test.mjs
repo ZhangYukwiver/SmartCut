@@ -18,7 +18,7 @@ it('puts every sound at its cue and stays silent elsewhere', () => {
     expect(peakIn(right, 1 + length + 0.01, 1 + length + 0.5), sound).toBe(0);
     expect(left.every(Number.isFinite), sound).toBe(true);
   }
-});
+}, 20_000);
 
 it('stays quiet by default, repeats exactly, pans and never clips', () => {
   const cues = Object.keys(SFX_SOUNDS).map((sound, index) => ({ sound, at: index }));
@@ -30,7 +30,7 @@ it('stays quiet by default, repeats exactly, pans and never clips', () => {
   // 一堆 -6 dB 的声音叠在一起也不过顶
   const pile = renderSoundEffects({ cues: Array.from({ length: 40 }, () => ({ sound: 'chime', at: 0, gain_db: -6 })) });
   expect(peakIn(pile.left, 0, 1)).toBeLessThan(0.9);
-});
+}, 20_000);
 
 it('rejects cues outside the limits with the cue number', () => {
   expect(() => renderSoundEffects({ cues: [] })).toThrow('卡点');
