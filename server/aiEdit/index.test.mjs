@@ -593,6 +593,8 @@ describe("AI edit media library", () => {
     expect(listed.media).toEqual([item]);
     const fileUrl = `${base}/v1/ai-edit/media/${item.id}/file?key=${encodeURIComponent(listed.key)}`;
     // 不带 Bearer 也能取，但 key 必须对
+    expect((await fetch(`${fileUrl}&download=1`)).headers.get("content-disposition")).toMatch(/^attachment; filename\*=UTF-8''/u);
+    expect((await fetch(fileUrl)).headers.get("content-disposition")).toBeNull();
     expect((await fetch(`${base}/v1/ai-edit/media/${item.id}/file?key=wrong`)).status).toBe(404);
     expect((await fetch(`${base}/v1/ai-edit/media/${item.id}/file`)).status).toBe(404);
     const full = await fetch(fileUrl);
@@ -1006,6 +1008,30 @@ const checkpointFiles = (directory, id) => readdir(path.join(directory, "ai-edit
 const userContents = (body) => body.messages.filter((message) => message.role === "user").map((message) => message.content);
 
 describe("AI edit board edits", () => {
+  it("changes a clip's volume from the board and tells the model", async () => {
+    const context = await startBoard({ fetchImpl: async () => textReply("好") });
+    const { session, clip } = await boardSession(context);
+    const quieter = await context.call(`/v1/ai-edit/sessions/${session.id}/edit`, { method: "POST", body: { name: "update_clip", arguments: { clip_id: clip, volume: 0.5 } } });
+    expect(quieter.status).toBe(200);
+    expect(quieter.body.project.tracks[0].segments[0].volume).toBe(0.5);
+    expect(quieter.body.session.undo).toEqual({ label: "调视频“海边.mp4”的音量", kind: "edit" });
+  });
+
+  it("reads the project's product facts into the system prompt of every request", async () => {
+    const requests = [];
+    const context = await startBoard({ fetchImpl: async (_url, init) => { requests.push(JSON.parse(init.body)); return textReply("好"); } });
+    const { call, directory, waitIdle } = context;
+    const { session, project } = (await call("/v1/ai-edit/sessions", { method: "POST", body: { title: "事实" } })).body;
+    const send = async (text) => { await call(`/v1/ai-edit/sessions/${session.id}/messages`, { method: "POST", body: { text, config: CONFIG } }); await waitIdle(session.id); };
+    await send("第一句");
+    expect(requests[0].messages[0].content).not.toContain("被宣传产品的事实");
+    const folder = path.join(directory, "ai-edit", "pages", `_shared-${project.id}`);
+    await mkdir(folder, { recursive: true });
+    await writeFile(path.join(folder, "facts.md"), "只在本机运行，不上传数据");
+    await send("第二句");
+    expect(requests[1].messages[0].content).toContain("只在本机运行，不上传数据");
+  });
+
   it("edits clips through the same tool checks, keeps a checkpoint per edit and tells the model on the next turn", async () => {
     const requests = [];
     const fetchImpl = async (_url, init) => { requests.push(JSON.parse(init.body)); return textReply("好"); };
@@ -1024,7 +1050,7 @@ describe("AI edit board edits", () => {
     expect(retitled.body.session.undo).toEqual({ label: "改文字“周末去海边”", kind: "edit" });
 
     // 只放开看板上的几种改动、update_clip 也只放开几项
-    for (const [name, args] of [["update_clip", { clip_id: clip, volume: 0.5 }], ["add_fade", { clip_id: clip, fade_in: 1 }], ["add_effect", { clip_id: clip, effect_type: "_1998", params: [50] }], ["export_to_jianying", {}], ["move_clip", "x"]]) {
+    for (const [name, args] of [["update_clip", { clip_id: clip, change_pitch: true }], ["add_fade", { clip_id: clip, fade_in: 1 }], ["add_effect", { clip_id: clip, effect_type: "_1998", params: [50] }], ["export_to_jianying", {}], ["move_clip", "x"]]) {
       expect(await edit(name, args)).toEqual({ status: 422, body: { error: "edit_not_allowed", message: "这个改动不能在看板上做。" } });
     }
     const split = await edit("split_clip", { clip_id: clip, offset: 0.4 });

@@ -12,7 +12,7 @@ import { runCliConversation } from "./cliTurn.mjs";
 import { KEYFRAME_CURVES } from "./curves.mjs";
 import { EditError } from "./errors.mjs";
 import { createFilmStudio } from "./film/studio.mjs";
-import { patchPageHtml } from "./film/pages.mjs";
+import { FACTS_FILE, patchPageHtml, sharedAssetBytes, sharedFolderOf } from "./film/pages.mjs";
 import { pageCandidates } from './pageCandidates.mjs';
 import { requireCurrentVideoReview } from './videoReview.mjs';
 import { backgroundNote, parseGenerateConfig } from "./generate.mjs";
@@ -48,10 +48,10 @@ const REPAIR_FALLBACK = new Set(["DRAFT_BOX_NOT_FOUND", "DRAFT_BOX_NOT_OWNED", "
 const EXPORT_MODES = new Set(["auto", "new", "update"]);
 // 没存指纹的老会话：索引里的修改时间比导出时间晚这么多才算在剪映里动过
 const DRAFT_CHANGED_AFTER_MS = 10_000;
-// 看板上能手动做的改动和各自放开的参数（null 是照工具定义）；update_clip 只放开时间、截取、倍速、文字和位置大小，update_track 只放开静音
+// 看板上能手动做的改动和各自放开的参数（null 是照工具定义）；update_clip 只放开时间、截取、倍速、音量、文字和位置大小，update_track 只放开静音
 const BOARD_EDITS = new Map([
   ["move_clip", null],
-  ["update_clip", new Set(["clip_id", "start", "duration", "source_start", "source_duration", "speed", "text", "transform", "font_family", "media_id", "drawing", "fit"])],
+  ["update_clip", new Set(["clip_id", "start", "duration", "source_start", "source_duration", "speed", "volume", "text", "transform", "font_family", "media_id", "drawing", "fit"])],
   ["add_keyframes", null],
   ["remove_keyframe", null],
   ["split_clip", null],
@@ -455,6 +455,7 @@ function describeEdit(name, args, before, after, result) {
   else if (keys.some((key) => ["duration", "source_start", "source_duration"].includes(key))) short = `裁剪${label}`;
   else if (only("speed")) short = `给${label}变速`;
   else if (only("font_family")) short = `换${label}的字体`;
+  else if (only("volume")) short = `调${label}的音量`;
   const { segment } = now;
   if (only("text")) return { label: short, note: `把${ref}改成了“${leading(segment.text, 40)}”` };
   const parts = [];
@@ -465,6 +466,7 @@ function describeEdit(name, args, before, after, result) {
   }
   // 看板裁剪时会带上原来的倍速，没变就不提
   if (keys.includes("speed") && Number(was?.segment.speed ?? 1) !== Number(segment.speed ?? 1)) parts.push(`倍速改成了 ${Math.round((segment.speed ?? 1) * 1000) / 1000} 倍`);
+  if (keys.includes("volume")) parts.push(`音量改成了 ${Math.round((segment.volume ?? 1) * 100)}%`);
   if (changed.length) parts.push(`调了${changed.join("、")}`);
   if (keys.includes("font_family")) parts.push(`字体换成了「${displayName(segment.font_family)}」`);
   return { label: short, note: parts.length ? `改了${ref}：${parts.join("，")}` : `改了${ref}` };
@@ -671,8 +673,53 @@ export function createAiEdit({
   /** 给模型的网页片段工具：按工程画布渲；改透明与否换了新素材时，把时间线上的旧素材换掉。 */
   const pageTools = (session, signal, requireVideoReview = false) => {
     const previews = pageCandidates(root, session.id);
+    const afterShared = async (folder, written, rerender) => {
+      const ref = `../${folder}/${written.file}`;
+      const rerendered = [];
+      if (rerender !== false) {
+        const { width, height, fps } = (await state.store.getProject(session.projectId)).canvas;
+        // ponytail: 一页页按顺序重渲（渲染浏览器本来就排队）；页多时这一步要等一会儿，前几次改动可以先填 rerender:false
+        for (const pageId of await state.film.pages.dependents(folder)) {
+          signal?.throwIfAborted();
+          try {
+            const result = await state.film.pages.rerender(pageId, { width, height, fps, signal });
+            rerendered.push({ page_id: pageId, media_id: result.item.id, title: result.item.name, duration: result.duration, ...(result.problems.length ? { problems: result.problems } : {}) });
+          } catch (error) {
+            if (signal?.aborted || error?.name === "AbortError") throw error;
+            rerendered.push({ page_id: pageId, error: error.message });
+          }
+        }
+      }
+      const failed = rerendered.filter((page) => page.error || page.problems);
+      return { path: written.file, ref, bytes: written.bytes, created: written.created, rerendered,
+        note: rerender === false ? "只写了文件，还没重渲；改完最后一个共用文件时 rerender 不填（默认重渲）。"
+          : !rerendered.length ? `还没有网页片段引用它：在页面里用 ${ref} 引用（比如 <script src="${ref}"></script>）。`
+          : failed.length ? `${failed.length} 页有问题，看 rerendered 里的 problems/error，改好再写一次。` : `引用它的 ${rerendered.length} 个网页片段已按原时长重渲，时间线上的画面已更新。` };
+    };
     return {
     read: (pageId) => state.film.pages.read(pageId),
+    /** 本工程的共用文件：不给 path 列出全部和引用地址，给了读内容。 */
+    readShared: async (args = {}) => {
+      const folder = sharedFolderOf(session.projectId);
+      if (args.path === undefined) {
+        const files = await state.film.pages.readShared(folder);
+        return { files: files.map((file) => ({ ...file, ref: `../${folder}/${file.path}` })), ...(files.length ? {} : { note: "还没有共用文件，用 write_shared_file 写。" }) };
+      }
+      return { path: args.path, ref: `../${folder}/${args.path}`, content: await state.film.pages.readShared(folder, args.path) };
+    },
+    /** 写共用文件；默认接着按原时长重渲所有引用这个文件夹的网页片段（素材原地换，时间线不动）。 */
+    writeShared: async (args) => {
+      const folder = sharedFolderOf(session.projectId);
+      const written = await state.film.pages.writeShared(folder, args.path, { content: args.content, patches: args.patches });
+      if (written.file === FACTS_FILE) return { path: written.file, bytes: written.bytes, created: written.created, rerendered: [], note: "产品事实已存好，之后每一轮都会放进系统提示，不用再读。" };
+      return afterShared(folder, written, args.rerender);
+    },
+    /** 放字体、图片进共用文件夹（素材库、CDN 或本机字体文件），之后和写共用文件一样重渲。 */
+    importShared: async (args) => {
+      const folder = sharedFolderOf(session.projectId);
+      return afterShared(folder, await state.film.pages.importShared(folder, args.path, await sharedAssetBytes(args, { library: state.library, signal })), args.rerender);
+    },
+    still: (args) => state.film.pages.still({ ...args, signal }),
     preview: async (args) => {
       const original = args.page_id ? await state.film.pages.read(args.page_id) : null;
       if (args.html !== undefined && args.patches !== undefined) throw new AiEditError('arguments_invalid', 'html 和 patches 二选一。', 422);
@@ -807,6 +854,12 @@ export function createAiEdit({
       pages: pageTools(session, signal, Boolean(turn.pageRefine)),
       candidates: pageCandidates(root, session.id),
       reviewClips: state.film.reviewClips,
+      timelineSheets: state.film.sheets,
+      checkOutput: async ({ render }) => {
+        const exported = render ? await renderInTurn(session, signal) : null;
+        const report = await state.film.checkMp4(session.id, await state.store.getProject(session.projectId), { signal });
+        return { ...report, ...(exported?.note ? { export_note: exported.note } : {}) };
+      },
       sessionId: session.id,
       reviewBudget: { calls: 0, noImprovement: 0 },
       // arrange_grid 排过的格子记在会话上（跟着会话存盘），换画布时按新画布重排
@@ -841,6 +894,7 @@ export function createAiEdit({
         // 目标每次请求都读最新的：一轮做到一半改了，下一步就照新的来
         system: async () => buildSystemPrompt({
           project: await store.getProject(session.projectId), media: library.list(), goal: session.goal, freeOnly: turn.freeOnly,
+          facts: await state.film.pages.readShared(sharedFolderOf(session.projectId), FACTS_FILE).catch(() => ""),
           generation: { image: Boolean(turn.generation?.image), video: turn.generation?.video ? turn.generation.video.provider ?? "seedance" : false }, skills: turn.skills,
         }) + (turn.pageRefine ? '\n本轮用户点击自动校准，当前工程含网页动画。先读取当前时间线、页面和已有候选，依据用户纠正与实际连续画面判断合成结构，再做最小修改；不要把底层连续播放加上层遮罩揭开误建成每窗独立视频或移动贴图。已有结构判断和有效评审优先复用。preview_page只查构图和脚本异常，review_video_clip(preview_id,start,duration)在当前时间线连同底层一起渲染问题前后2–4秒复核运动，有改善且无回退后write_page(preview_id)。候选不必等静帧完全一致才检查视频。参考关系已保存，不重复解析整条参考；没有新证据不反复请求或盲调同组参数。最多4次视频复核，连续两份无改善就停止并报告差异。不确定时只补能区分结构假设的短区间；缺少干净底片就明确缺失，不用含效果的成片假冒原始底片。采纳前复查原来正常的关键时刻与转场，判断仅覆盖实际输入区间。视频服务不可用时明确运动未验证，不用截图代替。不反复导出全片，不调用只支持drawing的refine_reference，不另造时间线。缺少唯一参考时才问一个关键问题。' : ''),
         context: async () => buildContextMessage({ project: await store.getProject(session.projectId), library }),
@@ -1043,10 +1097,10 @@ export function createAiEdit({
     void state.sessions.touch(session, { quiet: true });
   };
 
-  const startOutput = async (session, kind) => {
+  const startOutput = async (session, kind, { fromTurn = false } = {}) => {
     const { store, film } = state;
     const id = session.id;
-    if (running.has(id)) throw new AiEditError("session_busy", "AI 还在改时间线，等它做完再导出。", 409);
+    if (running.has(id) && !fromTurn) throw new AiEditError("session_busy", "AI 还在改时间线，等它做完再导出。", 409);
     if (exporting.has(id) || editing.has(id)) throw new AiEditError("session_busy", "上一个操作还没做完，请稍等。", 409);
     if (outputs.has(id)) throw new AiEditError("session_busy", "正在导出，请稍等。", 409);
     const project = await store.getProject(session.projectId);
@@ -1071,6 +1125,19 @@ export function createAiEdit({
       catch (error) { out.destroy(); await rm(file, { force: true }); throw error; }
       return { file: `renders/${id}-film/${name}`, name, size: (await stat(file)).size, ...(note ? { note } : {}) };
     });
+  };
+
+  /** AI 这一轮里自己出片：和看板上的「导出 MP4」同一条路，进度和成品照样挂在 session.output 上，用户点得到下载。 */
+  const renderInTurn = async (session, signal) => {
+    await startOutput(session, "mp4", { fromTurn: true });
+    const job = outputs.get(session.id);
+    const stop = () => job.controller.abort();
+    signal?.addEventListener("abort", stop, { once: true });
+    try { await job.promise; }
+    finally { signal?.removeEventListener("abort", stop); }
+    signal?.throwIfAborted();
+    if (session.output?.state !== "done") throw new AiEditError("output_failed", session.output?.error ?? "导出没做完。", 422);
+    return session.output;
   };
 
   const stopRun = async (id, timeoutMs = 5_000) => {
@@ -1098,7 +1165,7 @@ export function createAiEdit({
       sendJson(response, 404, { error: "media_not_found", message: "没有这个素材。" });
       return;
     }
-    await library.send(request, response, item);
+    await library.send(request, response, item, { download: url.searchParams.has("download") });
   };
 
   const route = async (request, response, url) => {

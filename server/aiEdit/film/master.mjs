@@ -7,13 +7,13 @@ export const TRUE_PEAK_DB = -2;
 export const LOUDNESS_TARGETS = [-14, -15, -16];
 
 /**
- * 积分响度（LUFS）：K 加权、400ms 块（重叠 75%）、-70 LUFS 绝对门限和 -10 LU 相对门限。太短或全是静音回 -Infinity。
+ * K 加权后 400ms 块（重叠 75%，每 100ms 一块）的均方值；不够一块回空数组。
  * ponytail: K 加权的系数是 48 kHz 的（BS.1770 表 1、2），别的采样率要按双线性变换重算
  */
-export function integratedLoudness(channels) {
+export function loudnessBlocks(channels) {
   const step = 4800;
   const parts = Math.floor(channels[0].length / step);
-  if (parts < 4) return -Infinity;
+  if (parts < 4) return [];
   const power = new Float64Array(parts);
   for (const data of channels) {
     // 第一级高架 + 第二级高通，直接型 I
@@ -28,12 +28,21 @@ export function integratedLoudness(channels) {
   }
   const blocks = [];
   for (let j = 0; j + 4 <= parts; j += 1) blocks.push((power[j] + power[j + 1] + power[j + 2] + power[j + 3]) / (4 * step));
+  return blocks;
+}
+
+/** 按 -70 LUFS 绝对门限和 -10 LU 相对门限算积分响度（LUFS）。太短或全是静音回 -Infinity。 */
+export function gatedLoudness(blocks) {
   const lufs = (z) => -0.691 + 10 * Math.log10(z);
   const mean = (list) => list.reduce((sum, z) => sum + z, 0) / list.length;
   const loud = blocks.filter((z) => z > 0 && lufs(z) > -70);
   if (!loud.length) return -Infinity;
   const relative = lufs(mean(loud)) - 10;
   return lufs(mean(loud.filter((z) => lufs(z) > relative)));
+}
+
+export function integratedLoudness(channels) {
+  return gatedLoudness(loudnessBlocks(channels));
 }
 
 /**
@@ -165,5 +174,39 @@ export function normalizeLoudness(channels, target, ceilingDb = -2) {
   return { before, after: now, peak: 20 * Math.log10(truePeak(channels)) };
 }
 
+/**
+ * 成片声音的指标：积分响度、真峰值（dBTP）、0.5 秒内瞬时响度（400ms 块）最大上跳、静音段（低于 -50 dBFS 至少 0.1 秒）。
+ * 上跳里比积分响度低 20 LU 以下的都按 -20 算（和 LRA 的门限一样），不然开头和静音后面一响就是几十 LU，真正的突变反而看不见。
+ * at 是开始变响的时刻。全是静音时 loudness、peak 回 -Infinity、jump 回 null。
+ */
+export function audioReport(channels, rate = 48000) {
+  const blocks = loudnessBlocks(channels);
+  const loudness = gatedLoudness(blocks);
+  let jump = null;
+  if (Number.isFinite(loudness)) {
+    const floor = loudness - 20;
+    const level = blocks.map((z) => (z > 0 ? Math.max(floor, -0.691 + 10 * Math.log10(z)) : floor));
+    jump = { lu: 0, at: 0, from: floor, to: floor };
+    for (let i = 1; i < level.length; i += 1) {
+      for (let j = Math.max(0, i - 5); j < i; j += 1) {
+        if (level[i] - level[j] > jump.lu) jump = { lu: level[i] - level[j], at: (j + 4) / 10, from: level[j], to: level[i] };
+      }
+    }
+  }
+  const step = rate / 100, limit = 10 ** (-50 / 20), n = channels[0].length;
+  const silences = [];
+  let from = null;
+  for (let at = 0; at < n + step; at += step) {
+    let quiet = at < n;
+    for (const data of channels) for (let i = at; quiet && i < Math.min(n, at + step); i += 1) if (Math.abs(data[i]) >= limit) quiet = false;
+    if (quiet) from ??= at;
+    else if (from !== null) {
+      if (at - from >= rate / 10) silences.push({ start: from / rate, end: Math.min(at, n) / rate });
+      from = null;
+    }
+  }
+  return { seconds: n / rate, loudness, peak: 20 * Math.log10(truePeak(channels)), jump, silences };
+}
+
 /** 编码页里用的源码：上面这几个函数原样拼进去。 */
-export const MASTER_SOURCE = [integratedLoudness, peakTrack, truePeak, limitPeaks, duckUnder, normalizeLoudness].map(String).join("\n");
+export const MASTER_SOURCE = [loudnessBlocks, gatedLoudness, integratedLoudness, peakTrack, truePeak, limitPeaks, duckUnder, normalizeLoudness, audioReport].map(String).join("\n");

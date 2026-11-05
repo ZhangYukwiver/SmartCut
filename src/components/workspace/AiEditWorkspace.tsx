@@ -1197,10 +1197,12 @@ function MediaShelf({ media, uploads, mediaUrl, onPick, onReplicate, onRemove, o
           <MediaThumb item={item} url={mediaUrl(item.id)} />
           <Text numberOfLines={1} style={styles.cardName}>{mediaTitle(item)}</Text>
           <Text numberOfLines={1} style={[styles.cardMeta, item.status === "failed" && { color: color.danger }]}>
-            {item.status === "importing" ? "正在导入…" : item.status === "failed" ? (item.error || "导入失败") : `${isSentMedia(item) ? "送来的视频 · " : item.source.type === "cutout" ? "抠图 · 透明 PNG · " : item.source.type === "image_edit" ? "精修 · PNG · " : item.source.type === "generated" ? "AI 生成 · " : item.source.type === "skill" ? `技能${item.source.skill ? ` · ${item.source.skill}` : ""} · ` : ""}${item.kind === "image" ? "图片" : item.durationUs ? spokenDuration(item.durationUs) : item.kind === "audio" ? "音频" : "视频"}`}
+            {item.status === "importing" ? "正在导入…" : item.status === "failed" ? (item.error || "导入失败") : `${isSentMedia(item) ? "送来的视频 · " : item.source.type === "cutout" ? "抠图 · 透明 PNG · " : item.source.type === "image_edit" ? "精修 · PNG · " : item.source.type === "generated" ? "AI 生成 · " : item.source.type === "cover" ? "封面 · " : item.source.type === "sfx" ? "音效 · " : item.source.type === "skill" ? `技能${item.source.skill ? ` · ${item.source.skill}` : ""} · ` : ""}${item.kind === "image" ? "图片" : item.durationUs ? spokenDuration(item.durationUs) : item.kind === "audio" ? "音频" : "视频"}`}
           </Text>
         </Pressable>
-        {item.kind === "image" && item.status === "ready" && item.source.type !== "cutout" ? <Pressable accessibilityRole="button"
+        {item.source.type === "cover" && item.status === "ready" && web && mediaUrl(item.id)
+          ? <a href={`${mediaUrl(item.id)}&download=1`} download={item.name} style={{ color: color.accent, fontFamily: font.body, fontSize: 12, fontWeight: 600, textDecoration: "none", padding: "5px 0" }}>下载封面</a> : null}
+        {item.kind === "image" && item.status === "ready" && item.source.type !== "cutout" && item.source.type !== "cover" ? <Pressable accessibilityRole="button"
           accessibilityLabel={`给「${mediaTitle(item)}」自动抠图`} accessibilityState={{ busy: Boolean(cutting[item.id]) }}
           disabled={!onCutout || Boolean(cutting[item.id])} onPress={() => onCutout?.(item.id)}
           style={[webPointer, { paddingVertical: 5, opacity: onCutout ? 1 : .5 }]}>

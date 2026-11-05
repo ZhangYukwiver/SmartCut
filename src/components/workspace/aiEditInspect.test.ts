@@ -94,7 +94,7 @@ describe("拖一下走几步", () => {
 describe("详情卡列哪些字段", () => {
   it("视频有时间、素材、倍速和画面四项；文字没有素材和倍速；特效只有时间", () => {
     const keys = (segment: Parameters<typeof inspectFields>[0]) => inspectFields(segment, { canvas, siblings: [] }).map((item) => item.key);
-    expect(keys(video("a", 0, 2 * S))).toEqual(["start", "duration", "source_start", "speed", "x", "y", "scale", "rotation", "alpha"]);
+    expect(keys(video("a", 0, 2 * S))).toEqual(["start", "duration", "source_start", "speed", "volume", "x", "y", "scale", "rotation", "alpha"]);
     expect(keys(text("t", 0, S))).toEqual(["start", "duration", "x", "y", "scale", "rotation", "alpha"]);
     const effect: EditTrackEffectSegment = { id: "e", kind: "track_effect", effect_type: "闪白", timeline: { start_us: 0, duration_us: S } };
     expect(keys(effect)).toEqual(["start", "duration"]);
@@ -200,6 +200,9 @@ describe("改完换成哪个看板改动", () => {
     expect(fieldEdit(clip, "speed", 2, canvas)).toEqual({ name: "update_clip", arguments: { clip_id: "a", speed: 2 } });
     expect(fieldEdit(clip, "speed", 1, canvas)).toBeNull();
     expect(fieldEdit(text("t", 0, S), "speed", 2, canvas)).toBeNull();
+    expect(fieldEdit(clip, "volume", 60, canvas)).toEqual({ name: "update_clip", arguments: { clip_id: "a", volume: 0.6 } });
+    expect(fieldEdit(clip, "volume", 100, canvas)).toBeNull();
+    expect(fieldEdit(text("t", 0, S), "volume", 60, canvas)).toBeNull();
   });
 
   it("套着的剪映效果：转场、动画时长和滤镜强度有框，改了是一批（动画全去掉再按原来的顺序加回来）", () => {

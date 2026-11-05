@@ -159,3 +159,66 @@ export async function openMovie(file, { container = "mp4" } = {}) {
     },
   };
 }
+
+function* boxesIn(data, start, end) {
+  for (let at = start; at + 8 <= end;) {
+    const size = data.readUInt32BE(at);
+    if (size < 8) return;
+    yield { type: data.toString("latin1", at + 4, at + 8), body: at + 8, end: at + size };
+    at += size;
+  }
+}
+const boxOf = (data, parent, type) => [...boxesIn(data, parent.body, parent.end)].find((item) => item.type === type);
+
+/**
+ * 读回 openMovie 写出的 MP4（一个样本一个 chunk）：视频样本的位置、大小、关键帧，两条轨在播放器里的时长。质检解码用。
+ * ponytail: 只认自己写的结构（moov 在末尾、一样本一 chunk），别的来源的 MP4 不走这里。
+ */
+export async function readMovie(file) {
+  const handle = await open(file, "r");
+  try {
+    const { size } = await handle.stat();
+    const head = Buffer.alloc(16);
+    let moov = null;
+    for (let at = 0; at + 8 <= size;) {
+      await handle.read(head, 0, 16, at);
+      const short = head.readUInt32BE(0);
+      const length = short === 1 ? Number(head.readBigUInt64BE(8)) : short;
+      if (length < 8) break;
+      if (head.toString("latin1", 4, 8) === "moov") {
+        moov = Buffer.alloc(length);
+        await handle.read(moov, 0, length, at);
+        break;
+      }
+      at += length;
+    }
+    if (!moov) throw new Error("文件里没有 moov，可能没导出完");
+    const root = [...boxesIn(moov, 0, moov.length)][0];
+    const result = { size, video: null, audio: null };
+    for (const trak of boxesIn(moov, root.body, root.end)) {
+      if (trak.type !== "trak") continue;
+      const mdia = boxOf(moov, trak, "mdia");
+      const kind = moov.toString("latin1", boxOf(moov, mdia, "hdlr").body + 8, boxOf(moov, mdia, "hdlr").body + 12);
+      const seconds = moov.readUInt32BE(boxOf(moov, trak, "tkhd").body + 20) / 1000;
+      if (kind === "soun") { result.audio = { seconds }; continue; }
+      if (kind !== "vide") continue;
+      const stbl = boxOf(moov, boxOf(moov, mdia, "minf"), "stbl");
+      const entry = [...boxesIn(moov, boxOf(moov, stbl, "stsd").body + 8, boxOf(moov, stbl, "stsd").end)][0];
+      const avcC = boxOf(moov, { body: entry.body + 78, end: entry.end }, "avcC");
+      const stsz = boxOf(moov, stbl, "stsz"), stco = boxOf(moov, stbl, "stco"), co64 = boxOf(moov, stbl, "co64"), stss = boxOf(moov, stbl, "stss");
+      const count = moov.readUInt32BE(stsz.body + 8);
+      const each = (fn) => Array.from({ length: count }, (_, index) => fn(index));
+      result.video = {
+        seconds, frames: count, width: moov.readUInt16BE(entry.body + 24), height: moov.readUInt16BE(entry.body + 26),
+        description: avcC ? moov.subarray(avcC.body, avcC.end) : null,
+        sizes: each((index) => moov.readUInt32BE(stsz.body + 12 + index * 4)),
+        offsets: each((index) => (co64 ? Number(moov.readBigUInt64BE(co64.body + 8 + index * 8)) : moov.readUInt32BE(stco.body + 8 + index * 4))),
+        keys: stss ? Array.from({ length: moov.readUInt32BE(stss.body + 4) }, (_, index) => moov.readUInt32BE(stss.body + 8 + index * 4) - 1) : each((index) => index),
+      };
+    }
+    if (!result.video) throw new Error("文件里没有视频轨");
+    return result;
+  } finally {
+    await handle.close();
+  }
+}

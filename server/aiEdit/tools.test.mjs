@@ -205,9 +205,94 @@ describe("AI edit tools", () => {
     expect((await run("write_page", JSON.stringify({ title: "缺内容" }))).result).toMatchObject({ ok: false, code: "arguments_invalid" });
   });
 
+  it("hands shared page files to the host and refuses content and patches together", async () => {
+    const calls = [];
+    const pages = {
+      writeShared: async (args) => { calls.push(["write", args]); return { path: args.path, ref: "../_shared-x/engine.js", bytes: 12, created: true, rerendered: [{ page_id: "a".repeat(16) }] }; },
+      readShared: async (args) => { calls.push(["read", args]); return { files: [{ path: "engine.js", bytes: 12, ref: "../_shared-x/engine.js" }] }; },
+    };
+    const { run } = runnerWith({ pages });
+    const { result, action } = await run("write_shared_file", JSON.stringify({ path: "engine.js", content: "window.E={}" }));
+    expect(result).toMatchObject({ ok: true, ref: "../_shared-x/engine.js", rerendered: [{ page_id: "a".repeat(16) }] });
+    expect(action).toMatchObject({ ok: true, summary: "写了共用文件「engine.js」" });
+    expect((await run("write_shared_file", JSON.stringify({ path: "engine.js", content: "x", patches: [{ find: "a", replace: "b" }] }))).result).toMatchObject({ ok: false, code: "arguments_invalid" });
+    expect((await run("write_shared_file", JSON.stringify({ path: "engine.js" }))).result).toMatchObject({ ok: false, code: "arguments_invalid" });
+    expect((await run("read_shared_file", "{}")).result).toMatchObject({ ok: true, files: [{ path: "engine.js" }] });
+    expect(calls.map(([kind]) => kind)).toEqual(["write", "read"]);
+  });
+
+  it("hands font and image imports to the host", async () => {
+    const calls = [];
+    const { run } = runnerWith({ pages: { importShared: async (args) => { calls.push(args); return { path: args.path, ref: "../_shared-x/fonts/a.woff2", bytes: 9, created: true, rerendered: [] }; } } });
+    const { result, action } = await run("import_shared_file", JSON.stringify({ path: "fonts/a.woff2", url: "https://cdn.jsdelivr.net/a.woff2" }));
+    expect(result).toMatchObject({ ok: true, ref: "../_shared-x/fonts/a.woff2" });
+    expect(action.summary).toBe("放进共用文件「fonts/a.woff2」");
+    expect(calls).toEqual([{ path: "fonts/a.woff2", url: "https://cdn.jsdelivr.net/a.woff2" }]);
+  });
+
+  it("checks the exported film through the host and says when it cannot", async () => {
+    const asked = [];
+    const { run } = runnerWith({ checkOutput: async (args) => { asked.push(args); return { duration: 54, issues: ["2 秒附近 0.5 秒内响度上跳 9 LU，会一惊一乍"] }; } });
+    expect((await run("check_output", "{}")).result).toMatchObject({ ok: true, duration: 54, issues: [expect.stringContaining("上跳")] });
+    const { result, action } = await run("check_output", JSON.stringify({ render: true }));
+    expect(result.ok).toBe(true);
+    expect(action.summary).toBe("导出并检查了成片");
+    expect(asked).toEqual([{ render: false }, { render: true }]);
+    expect((await runnerWith().run("check_output", "{}")).result).toMatchObject({ ok: false, code: "film_unavailable" });
+  });
+
+  it("exports covers into the library, replaces the same aspect and warns about black bars", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "cover-tool-"));
+    try {
+      const { default: sharp } = await import("sharp");
+      const paint = (width, height, bars) => sharp({ create: { width, height, channels: 3, background: "#808080" } })
+        .composite(bars ? [{ input: { create: { width, height: Math.round(height * 0.12), channels: 3, background: "#000000" } }, top: 0, left: 0 }, { input: { create: { width, height: Math.round(height * 0.12), channels: 3, background: "#000000" } }, top: height - Math.round(height * 0.12), left: 0 }] : [])
+        .jpeg().toBuffer();
+      const items = [];
+      const media = { root, list: () => items, adopt: async (temp, meta) => {
+        await rm(temp);
+        const item = items.find((entry) => entry.id === meta.id) ?? { id: `m${items.length}` };
+        Object.assign(item, { name: meta.name, source: meta.source });
+        if (!items.includes(item)) items.push(item);
+        return item;
+      } };
+      const shots = [];
+      let bars = false;
+      const pages = { still: async (args) => { shots.push(args); return Promise.all(args.shots.map(async ({ aspect, width, height }) => ({ aspect, width, height, image: await paint(width, height, bars), problems: [] }))); } };
+      const run = createToolRunner({ store: { getProject: async () => project() }, library: media, projectId: "p".repeat(32), pages });
+      const first = (await run("export_cover", JSON.stringify({ page_id: "a".repeat(16), time: 1.5 }))).result;
+      expect(first.covers.map((cover) => [cover.aspect, cover.width, cover.height])).toEqual([["16:9", 1920, 1080], ["4:3", 1440, 1080], ["3:4", 1080, 1440]]);
+      expect(first.covers.some((cover) => cover.bars)).toBe(false);
+      expect(shots[0]).toMatchObject({ pageId: "a".repeat(16), html: null, time: 1.5 });
+      expect(items.map((item) => item.name)).toEqual(["旅行封面-16比9.jpg", "旅行封面-4比3.jpg", "旅行封面-3比4.jpg"]);
+      bars = true;
+      const again = (await run("export_cover", JSON.stringify({ html: "<script>window.film={}</script>", aspects: ["16:9"] }))).result;
+      expect(again.covers[0]).toMatchObject({ media_id: "m0", bars: "上下" });
+      expect(items).toHaveLength(3);
+      expect((await run("export_cover", "{}")).result).toMatchObject({ ok: false, code: "arguments_invalid" });
+      expect((await run("export_cover", JSON.stringify({ page_id: "a".repeat(16), aspects: ["1:1"] }))).result).toMatchObject({ ok: false, code: "arguments_invalid" });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("shows the whole-timeline contact sheet to local models and asks the vision model only for API models", async () => {
+    const jpeg = Buffer.from("fake-jpeg");
+    const rendered = [];
+    const timelineSheets = { render: async (args) => { rendered.push(args); return { sheets: [jpeg], frames: args.times.map((time) => ({ time, luma: 0.2, bright: 0, dark: 0.1, saturation: 0.3 })), flags: [], problems: [] }; } };
+    const local = runnerWith({ timelineSheets, sessionId: "s".repeat(32), config: { runtime: "codex" } });
+    const { result } = await local.run("review_timeline", JSON.stringify({ count: 6 }));
+    expect(result).toMatchObject({ ok: true, duration: 4 });
+    expect(result.times).toEqual([0.333, 1, 1.667, 2.333, 3, 3.667]);
+    expect(rendered[0]).toMatchObject({ sessionId: "s".repeat(32), times: result.times });
+    expect(result.review).toContain("直接看图");
+    expect((await local.run("review_timeline", JSON.stringify({ times: [1, 99] }))).result).toMatchObject({ ok: false, code: "arguments_invalid" });
+    expect((await local.run("review_timeline", JSON.stringify({ start: 5, end: 2 }))).result).toMatchObject({ ok: false, code: "arguments_invalid" });
+  });
+
   it("cover every ProjectStore edit method and convert seconds and media ids", async () => {
     const { run, calls } = runnerWith();
-    const offline = new Set(["remove_image_background", "inspect_image", "repair_image_regions", "extract_reference_frame", "review_video_frames", "review_video_clip", "get_page_candidates", "preview_page", "analyze_reference", "replicate_reference", "refine_reference", "add_drawing_clip", "update_drawing_clip", "detect_beats", "write_page", "read_page", "generate_image", "generate_video", "transcribe_subtitles", ...SKILL_TOOLS]);
+    const offline = new Set(["remove_image_background", "inspect_image", "repair_image_regions", "extract_reference_frame", "review_video_frames", "review_video_clip", "get_page_candidates", "preview_page", "analyze_reference", "replicate_reference", "refine_reference", "add_drawing_clip", "update_drawing_clip", "detect_beats", "write_page", "read_page", "write_shared_file", "import_shared_file", "read_shared_file", "review_timeline", "export_cover", "make_sound_effects", "check_output", "generate_image", "generate_video", "transcribe_subtitles", ...SKILL_TOOLS]);
     expect(TOOL_NAMES.filter((name) => !offline.has(name)).sort()).toEqual(Object.keys(SAMPLE_ARGS).sort());
     for (const [name, args] of Object.entries(SAMPLE_ARGS)) {
       const { result, action } = await run(name, JSON.stringify(args));
@@ -470,6 +555,13 @@ describe("AI edit tools", () => {
     expect(buildSystemPrompt({ project: changed, media: media.list(), library: media })).toBe(prompt);
     // 用户定的目标写在系统提示里（对话历史被裁掉也还在）；没定就不提
     expect(prompt).not.toContain("定的目标");
+    expect(prompt).toContain("import_shared_file");
+    expect(prompt).not.toContain("只用系统字体");
+    const facts = buildSystemPrompt({ project: project(), media: [], facts: "刷视频不套屏蔽词" });
+    expect(facts).toContain("被宣传产品的事实");
+    expect(facts).toContain("刷视频不套屏蔽词");
+    expect(buildSystemPrompt({ project: project(), media: [] })).not.toContain("被宣传产品的事实");
+    expect(buildSystemPrompt({ project: project(), media: [], facts: "x".repeat(9_000) })).toContain("后面还有");
     const goal = buildSystemPrompt({ project: project(), media: media.list(), goal: "30 秒旅行卡点快闪，越往后切得越快" });
     expect(goal).toContain("用户给这条片子定的目标");
     expect(goal).toContain("\n30 秒旅行卡点快闪，越往后切得越快\n");

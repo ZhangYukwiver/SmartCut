@@ -11,8 +11,11 @@ import { openTab } from "./browser.mjs";
 import { QUALITY_BITS, encodeMp4 } from "./encoder.mjs";
 import { volumeAt } from "../clipLook.mjs";
 import { FILM_FILE, droppedText, filmToPlan, projectToFilm, transformOf } from "./filmFile.mjs";
+import { readMovie } from "./mp4.mjs";
+import { judgeOutput } from "./outputCheck.mjs";
 import { createPages } from "./pages.mjs";
 import { createReviewClips } from './reviewClips.mjs';
+import { createTimelineSheets } from './timelineSheet.mjs';
 import { createFilmFiles } from "./serve.mjs";
 
 // openfilm 工程化接进 AI 剪辑：网页片段（pages.mjs）、film.html 工程导出 / 导入（zip）、按 film.html 在本机出 MP4。
@@ -27,6 +30,7 @@ const US = 1_000_000;
 
 const within = (folder, file) => file === folder || file.startsWith(folder + path.sep);
 const safeName = (name) => String(name ?? "").replace(/[\\/:*?"<>|\u0000-\u001f]/gu, " ").trim().slice(0, 60) || "未命名剪辑";
+const timelineSeconds = (project) => Math.max(0, ...project.tracks.flatMap((track) => (track.segments ?? []).map((segment) => segment.timeline.start_us + segment.timeline.duration_us))) / US;
 
 export function createFilmStudio({ root, library, provider, getOrigin }) {
   const files = createFilmFiles({ root });
@@ -42,6 +46,7 @@ export function createFilmStudio({ root, library, provider, getOrigin }) {
     files,
     pages,
     reviewClips: createReviewClips({ root, library, files, provider, getOrigin }),
+    sheets: createTimelineSheets({ root, library, files, provider, getOrigin }),
 
     /** 工程打包成 zip（film.html + assets/ + pages/ + text/）写进 out（文件写入流）。回没带过去的说明。 */
     async exportZip(project, out, { signal } = {}) {
@@ -289,7 +294,7 @@ export function createFilmStudio({ root, library, provider, getOrigin }) {
      */
     async renderMp4(sessionId, project, { onProgress = () => undefined, signal } = {}) {
       if (!provider) throw new AiEditError("film_unavailable", "这个环境没有能渲染网页的浏览器。", 503);
-      const duration = Math.max(0, ...project.tracks.flatMap((track) => (track.segments ?? []).map((segment) => segment.timeline.start_us + segment.timeline.duration_us))) / US;
+      const duration = timelineSeconds(project);
       if (!(duration > 0)) throw new AiEditError("project_empty", "时间线还是空的，先放点素材再出片。", 422);
       const folder = path.join(renders, sessionId);
       await rm(folder, { recursive: true, force: true });
@@ -335,6 +340,32 @@ export function createFilmStudio({ root, library, provider, getOrigin }) {
         return { file, name, dropped: droppedText(dropped), silent: result.silent, size: (await stat(file)).size };
       } finally {
         await Promise.allSettled([film.close(), encoder?.close()]);
+      }
+    },
+
+    /** 量这个会话最新导出的 MP4：逐帧亮度和声音指标（outputCheck.mjs 的报告），再加上它是不是比时间线旧。 */
+    async checkMp4(sessionId, project, { signal } = {}) {
+      if (!provider) throw new AiEditError("film_unavailable", "这个环境没有能解码的浏览器。", 503);
+      const name = (await readdir(path.join(renders, sessionId)).catch(() => [])).find((file) => file.endsWith(".mp4"));
+      if (!name) throw new AiEditError("output_missing", "这个工程还没导出过 MP4：填 render:true 先导出一份。", 409);
+      const file = path.join(renders, sessionId, name);
+      const movie = await readMovie(file).catch((error) => { throw new AiEditError("output_unreadable", `成片读不了：${error.message}`, 422); });
+      const { sizes, offsets, keys, description } = movie.video;
+      // avc1.<profile><兼容位><level>，avcC 第 1–3 字节
+      const codec = `avc1.${description.subarray(1, 4).toString("hex")}`;
+      const origin = getOrigin();
+      const tab = await openTab(provider, files.urlFor(origin, "__encoder.html"), { plain: true });
+      const stop = () => void tab.close();
+      signal?.addEventListener("abort", stop, { once: true });
+      try {
+        signal?.throwIfAborted();
+        const measured = await tab.evaluate(`enc.inspect(${JSON.stringify({ src: files.urlFor(origin, `renders/${sessionId}/${name}`), codec, description: description.toString("base64"), sizes, offsets, keys })})`);
+        const report = judgeOutput({ movie, measured, timeline: timelineSeconds(project), target: project.canvas.loudness ?? null });
+        const { mtime } = await stat(file);
+        return { name, exported_at: mtime.toISOString(), ...report, ...(mtime < new Date(project.updated_at) ? { stale: true } : {}) };
+      } finally {
+        signal?.removeEventListener("abort", stop);
+        await tab.close();
       }
     },
   };
