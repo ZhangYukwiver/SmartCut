@@ -1,5 +1,6 @@
 import { MASTER_SOURCE, TRUE_PEAK_DB } from "./master.mjs";
 import { openMovie } from "./mp4.mjs";
+import { frameLight } from "./outputCheck.mjs";
 
 // 编码在渲染浏览器里做（WebCodecs：H.264 + AAC），不带 ffmpeg。截好的帧（JPEG）用 base64 送进编码页，
 // 编好的数据块再取回来，由 mp4.mjs 装进文件。混音也在编码页里：OfflineAudioContext 按 film.html 的声音片段摆好，
@@ -12,6 +13,7 @@ export const QUALITY_BITS = { high: 0.15, standard: 0.08, small: 0.04 };
 
 export const ENCODER_PAGE = `<!doctype html><meta charset="utf-8"><title>encoder</title><script>
 ${MASTER_SOURCE}
+${frameLight}
 const b64 = (bytes) => new Promise((done) => { const reader = new FileReader(); reader.onload = () => done(String(reader.result).slice(String(reader.result).indexOf(',') + 1)); reader.readAsDataURL(new Blob([bytes])); });
 const bytesOf = async (chunk) => { const data = new Uint8Array(chunk.byteLength); chunk.copyTo(data); return b64(data); };
 // 某些系统 AAC 编码器把预滚样本也标为 timestamp=0（macOS 的 Chrome 就是）。用独立脉冲测同一编码配置的延迟，不把测试声音写进成片。
@@ -142,6 +144,30 @@ window.enc = {
     return { sampleRate: rate, channels: 2, bitrate: 192000, primingSamples,
       description: described ? await b64(described) : null, skipped: [...skipped], master,
       chunks: await Promise.all(chunks.map(async (c) => ({ data: await bytesOf(c), samples: Math.round((c.duration ?? 21333) * rate / 1e6) }))) };
+  },
+  // 成片质检：逐帧解码量亮度，再把声音整段解出来量响度。样本表是 mp4.mjs 的 readMovie 读出来的；时间戳就是帧号（微秒单位，不是真时间）
+  async inspect({ src, codec, description, sizes, offsets, keys }) {
+    const data = await (await fetch(src)).arrayBuffer();
+    const canvas = new OffscreenCanvas(96, 54), context = canvas.getContext('2d', { willReadFrequently: true });
+    const frames = new Array(sizes.length).fill(null), isKey = new Set(keys);
+    let broken = null;
+    const decoder = new VideoDecoder({ output(frame) {
+      const at = frame.timestamp;
+      context.drawImage(frame, 0, 0, 96, 54); frame.close();
+      frames[at] = frameLight(context.getImageData(0, 0, 96, 54).data);
+    }, error(e) { broken = e; } });
+    decoder.configure({ codec, description: Uint8Array.from(atob(description), (c) => c.charCodeAt(0)) });
+    for (let i = 0; i < sizes.length; i++) {
+      if (broken) throw broken;
+      decoder.decode(new EncodedVideoChunk({ type: isKey.has(i) ? 'key' : 'delta', timestamp: i, data: new Uint8Array(data, offsets[i], sizes[i]) }));
+      while (decoder.decodeQueueSize > 8) await new Promise((r) => setTimeout(r, 1));
+    }
+    await decoder.flush();
+    decoder.close();
+    if (broken) throw broken;
+    // decodeAudioData 把 data 拿走，放在最后
+    const sound = await new OfflineAudioContext(2, 1, 48000).decodeAudioData(data).catch(() => null);
+    return { frames, audio: sound ? audioReport(Array.from({ length: sound.numberOfChannels }, (_, c) => sound.getChannelData(c))) : null };
   },
 };
 </script>`;

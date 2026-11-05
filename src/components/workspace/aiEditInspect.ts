@@ -204,7 +204,7 @@ export function scrubValue(start: number, dx: number, step: number, mods?: StepM
 
 // ---------- 详情卡列哪些字段 ----------
 
-export type FieldKey = "start" | "duration" | "source_start" | "speed" | "x" | "y" | "scale" | "rotation" | "alpha" | "transition" | "filter" | `anim_${AnimationPhase}`;
+export type FieldKey = "start" | "duration" | "source_start" | "speed" | "volume" | "x" | "y" | "scale" | "rotation" | "alpha" | "transition" | "filter" | `anim_${AnimationPhase}`;
 
 export interface InspectField {
   key: FieldKey;
@@ -254,6 +254,7 @@ const KEYED: Partial<Record<FieldKey, { properties: readonly string[]; name: str
   scale: { properties: ["uniform_scale", "scale_x", "scale_y"], name: "缩放" },
   rotation: { properties: ["rotation"], name: "旋转" },
   alpha: { properties: ["alpha"], name: "不透明度" },
+  volume: { properties: ["volume"], name: "音量" },
 };
 
 /** 这个字段有关键帧动画时改不了的原因：静态值会被动画盖掉；没有关键帧为 null */
@@ -332,6 +333,11 @@ export function inspectFields(segment: EditSegment, ctx: InspectContext): Inspec
       key: "speed", label: "倍速", name: "倍速", unit: "倍", value: round(speed, 3), step: 0.1, time: false, digits: 3, ctx: { units: ["倍", "×", "x"] }, disabled: null,
       hint: "1 是原速，2 是快一倍；截取的素材不变，时间线上的长度跟着变",
       min: Math.min(speed, Math.max(0.1, sourceUs / (nextStart - start))), max: Math.max(speed, Math.min(100, sourceUs / shortest)),
+    });
+    const volumeKeyed = keyedReason(segment, "volume");
+    fields.push({
+      key: "volume", label: "音量", name: "音量", unit: "%", value: Math.round((media.volume ?? 1) * 100), min: 0, max: 200, step: 1, time: false, digits: 0, ctx: { percent: "self" },
+      hint: "100 是原声，0 是静音，最大 200", disabled: volumeKeyed, ...(volumeKeyed ? { animated: true } : {}),
     });
   }
   if (hasTransform(segment)) {
@@ -433,6 +439,10 @@ export function fieldEdit(segment: EditSegment, key: FieldKey, value: number, ca
       return !hasSource(segment) || us === segment.source.start_us ? null : { name: "update_clip", arguments: { clip_id, source_start: seconds(us) } };
     case "speed":
       return !hasSource(segment) || Math.abs(value - (segment.speed > 0 ? segment.speed : 1)) < 1e-6 ? null : { name: "update_clip", arguments: { clip_id, speed: value } };
+    case "volume": {
+      const volume = Math.round(clamp(value, 0, 200)) / 100;
+      return !hasSource(segment) || Math.abs(volume - (segment.volume ?? 1)) < 1e-6 ? null : { name: "update_clip", arguments: { clip_id, volume } };
+    }
     case "transition": {
       const transition = "transition" in segment ? segment.transition : null;
       return !transition || us === spanUs(transition) ? null

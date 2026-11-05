@@ -317,7 +317,7 @@ export class MediaLibrary {
   }
 
   /** 按 Range 回文件：没有 Range 回 200 全量，有就回 206，越界 416。 */
-  async send(request, response, item) {
+  async send(request, response, item, { download = false } = {}) {
     const target = this.filePath(item);
     let size;
     try { size = (await stat(target)).size; } catch {
@@ -325,7 +325,8 @@ export class MediaLibrary {
       response.end(JSON.stringify({ error: "media_not_found", message: "素材文件找不到了。" }));
       return;
     }
-    const headers = { "Content-Type": mediaContentType(item.file), "Accept-Ranges": "bytes" };
+    const headers = { "Content-Type": mediaContentType(item.file), "Accept-Ranges": "bytes",
+      ...(download ? { "Content-Disposition": `attachment; filename*=UTF-8''${encodeURIComponent(item.name)}` } : {}) };
     const match = /^bytes=(\d*)-(\d*)$/u.exec(String(request.headers.range ?? "").trim());
     let start = 0;
     let end = size - 1;
