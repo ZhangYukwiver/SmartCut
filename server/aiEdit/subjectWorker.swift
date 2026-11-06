@@ -28,7 +28,7 @@ func handCrop(_ image: CIImage, _ joints: Joints, _ folder: URL, _ index: Int, _
   let w = image.extent.width, h = image.extent.height
   let dx = (middle[0]-wrist[0])*w, dy = (middle[1]-wrist[1])*h, length = hypot(dx,dy)
   guard length > 8 else { return nil }
-  let up = [dx/length,dy/length], across = [-dy/length,dx/length]
+  let up: [Double] = [Double(dx/length),Double(dy/length)], across: [Double] = [Double(-dy/length),Double(dx/length)]
   let points = joints.values.filter { $0[2] > 0.2 }.map { [$0[0]*w,$0[1]*h] }
   let xs = points.map { $0[0]*across[0]+$0[1]*across[1] }, ys = points.map { $0[0]*up[0]+$0[1]*up[1] }
   guard let x0=xs.min(), let x1=xs.max(), let y0=ys.min(), let y1=ys.max() else { return nil }
@@ -186,9 +186,8 @@ struct Identity {
       } else if !expanded(c.rect, 0.075, 0.075).contains(target) {
         continue
       }
-      let diffs = zip(signature, c.appearance).compactMap { a, b in
-        a < 0 || b < 0 ? nil : abs(a - b)
-      }
+      var diffs = [Double]()
+      for (a,b) in zip(signature,c.appearance) where a >= 0 && b >= 0 { diffs.append(abs(a-b)) }
       let error = diffs.reduce(0, +) / Double(max(1, diffs.count))
       if error > 0.24 { continue }
       ranked.append((c, d + error * 0.55))
