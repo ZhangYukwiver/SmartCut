@@ -61,6 +61,16 @@ export function createImageRefine({ root, library, signal = new AbortController(
   }
   return {
     busy: id => active.has(id),
+    /** Internal background recovery: infer only never-observed pixels, not their bounding box. */
+    async repairMask(id, selection, { signal: requestSignal, progress = () => {} } = {}) {
+      const { reference }=validate(id);assertCapacity();
+      const taskSignal=AbortSignal.any([signal,requestSignal].filter(Boolean));taskSignal.throwIfAborted();lock(id);
+      const result=tail.catch(()=>undefined).then(async()=>{
+        const {default:sharp}=await import('sharp');
+        const image=await sharp(reference).rotate().ensureAlpha().png().toBuffer();
+        return run(id,image,selection,progress,taskSignal);
+      });tail=result.catch(()=>undefined);try{return await result;}finally{unlock(id);}
+    },
     /** AI 与手动涂选使用同一修复器、队列和来源记录；坐标相对图片显示方向。 */
     async repairRegions(id, regions, { signal: requestSignal, progress = () => {} } = {}) {
       const { reference } = validate(id);

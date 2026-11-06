@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { createWriteStream } from "node:fs";
-import { mkdir, rm, stat } from "node:fs/promises";
+import { mkdir, realpath, rm, stat } from "node:fs/promises";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 
@@ -15,6 +15,7 @@ import { createFilmStudio } from "./film/studio.mjs";
 import { FACTS_FILE, patchPageHtml, sharedAssetBytes, sharedFolderOf } from "./film/pages.mjs";
 import { pageCandidates } from './pageCandidates.mjs';
 import { requireCurrentVideoReview } from './videoReview.mjs';
+import { createReviewGate, runReviewedConversation } from './reviewTurn.mjs';
 import { backgroundNote, parseGenerateConfig } from "./generate.mjs";
 import { AiEditError, MediaLibrary, isMediaId, publicItem } from "./library.mjs";
 import { displayName, withPreviewHints } from "./catalog.mjs";
@@ -535,7 +536,7 @@ export function createAiEdit({
   longPollMs = 8_000,
   maxUploadBytes,
 } = {}) {
-  const root = path.join(dataDirectory, "ai-edit");
+  let root = path.join(dataDirectory, "ai-edit");
   const running = new Map();
   // 参考视频的解析结果，各会话共用（不进解析库）
   const references = new Map();
@@ -549,6 +550,8 @@ export function createAiEdit({
 
   const init = async () => {
     await mkdir(root, { recursive: true, mode: 0o700 });
+    // 与素材库统一使用真实路径，避免 /tmp 等目录别名被复核器误判为库外路径。
+    root = await realpath(root);
     // 剪映相关的模块（特效目录 1MB+、草稿序列化）第一次用到才加载
     const media = injectedProbe && injectedKindOf ? null : await import("./media.mjs");
     const probe = injectedProbe ?? media.probeMedia;
@@ -772,6 +775,7 @@ export function createAiEdit({
       const longer = used.filter((item) => item.source && item.source.start_us + item.source.duration_us > result.duration * 1_000_000 + 1_000);
       return {
         media_id: result.item.id, page_id: result.pageId, duration: result.duration, size: `${result.item.width}×${result.item.height}`,
+        ...(result.subjectAudit?{subject_audit:result.subjectAudit,delivery_status:result.subjectAudit.status==='pass'?'mechanics_pass_visual_review_required':'draft_subject_checks_failed'}:{}),
         transparent: Boolean(result.item.source?.transparent),
         ...(result.problems.length ? { problems: result.problems } : {}),
         note: used.length
@@ -812,6 +816,10 @@ export function createAiEdit({
       },
       touch: () => void sessions.touch(session, { quiet: true }),
     });
+    const reviewBudget = { calls: 0, noImprovement: 0 };
+    const candidates = pageCandidates(root, session.id);
+    const pages = pageTools(session, signal, Boolean(turn.pageRefine));
+    const reviewGate = createReviewGate({ store, projectId: session.projectId, candidates, pages, reviewClips: state.film.reviewClips, budget: reviewBudget, library });
     const runTool = createToolRunner({
       store, library, projectId: session.projectId, signal,
       cutout: state.cutout,
@@ -851,8 +859,8 @@ export function createAiEdit({
       shutdown: shutdown.signal,
       exportDraft: (mode) => exportSession(session, { mode }),
       onRename: (name) => { session.title = name; },
-      pages: pageTools(session, signal, Boolean(turn.pageRefine)),
-      candidates: pageCandidates(root, session.id),
+      pages,
+      candidates,
       reviewClips: state.film.reviewClips,
       timelineSheets: state.film.sheets,
       checkOutput: async ({ render }) => {
@@ -861,7 +869,9 @@ export function createAiEdit({
         return { ...report, ...(exported?.note ? { export_note: exported.note } : {}) };
       },
       sessionId: session.id,
-      reviewBudget: { calls: 0, noImprovement: 0 },
+      reviewBudget,
+      userRequest: session.history.filter(m => m.role === 'user').map(m => m.content).filter(s => typeof s === 'string').join('\n').slice(0, 12000),
+      getGoal: () => session.goal,
       // arrange_grid 排过的格子记在会话上（跟着会话存盘），换画布时按新画布重排
       grids: session.grids,
     });
@@ -879,7 +889,12 @@ export function createAiEdit({
       } else {
       // 本机 CLI 自己跑工具循环，工具经 MCP 回调同一个 execute（cliTurn.mjs）
       const converse = isLocalRuntime(config.runtime) ? runCliConversation : runConversation;
-      const result = await converse({
+      const result = await runReviewedConversation({
+        converse, reviewGate,
+        onContinue: async attempt => {
+          streaming.actions.push({ name: 'continue_review', summary: `验收未通过，自动继续修正（${attempt}/3）`, ok: true });
+          await sessions.touch(session);
+        },
         // 生成工具只在配了 Key 时才给、技能工具只在有启用的技能时才给（本机 CLI 的 MCP 工具清单也走这里）
         config, history: session.history, tools: toolsFor({ generation: turn.generation, skills: turn.skills }), signal, fetchImpl, onText, maxToolCalls: MAX_TOOL_CALLS,
         localAi, goal: () => session.goal,
@@ -900,6 +915,7 @@ export function createAiEdit({
         context: async () => buildContextMessage({ project: await store.getProject(session.projectId), library }),
         execute: async (call) => {
           const { result: output, action } = await runTool(call.name, call.arguments);
+          reviewGate.observe(call.name, output);
           streaming.actions.push(action);
           await sessions.touch(session);
           return output;

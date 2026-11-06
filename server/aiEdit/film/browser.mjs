@@ -126,7 +126,7 @@ const SEEK = `(async (t) => {
  * 回 { meta: { duration, width, height, sounds }, problems, seek(t), capture({ format, quality }), evaluate(expr), close() }。
  * plain：不是网页片段（编码页），不等 window.film。
  */
-export async function openTab(provider, url, { width = 1920, height = 1080, background = null, plain = false } = {}) {
+export async function openTab(provider, url, { width = 1920, height = 1080, background = null, plain = false, initScript } = {}) {
   const target = await provider.newTarget();
   const problems = [];
   const said = (text) => { if (problems.length < 20) problems.push(String(text).slice(0, 300)); };
@@ -144,6 +144,7 @@ export async function openTab(provider, url, { width = 1920, height = 1080, back
     await target.send("Page.enable");
     await target.send("Runtime.enable");
     await target.send("Network.enable");
+    if (initScript) await target.send('Page.addScriptToEvaluateOnNewDocument', { source: initScript });
     await target.send("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: 1, mobile: false });
     if (background) await target.send("Emulation.setDefaultBackgroundColorOverride", { color: { r: 0, g: 0, b: 0, a: background === "transparent" ? 0 : 1 } });
     const loaded = wait(target, "Page.loadEventFired", READY_MS);

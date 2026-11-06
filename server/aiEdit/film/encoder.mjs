@@ -75,10 +75,10 @@ window.enc = {
     return { chunks, description: config ? await b64(config) : null };
   },
   // sounds 里 role 是 voice 的是旁白，duck 的在旁白响时压低；loudness 给了就归一化到这个响度（LUFS），真峰值压在 ceiling（dBTP）以下
-  async audio({ duration, sounds, loudness = null, ceiling = -2 }) {
+  async audio({ duration, sounds, loudness = null, ceiling = -2, wav = null }) {
     const rate = 48000;
     const settings = { codec: 'mp4a.40.2', sampleRate: rate, numberOfChannels: 2, bitrate: 192000 };
-    if (!sounds.length || !(await AudioEncoder.isConfigSupported(settings)).supported) return null;
+    if (!sounds.length || (!wav && !(await AudioEncoder.isConfigSupported(settings)).supported)) return null;
     const length = Math.max(1, Math.ceil(duration * rate));
     // 解出来的 AudioBuffer 哪个上下文都能用：同一个文件只解一次
     const decoder = new OfflineAudioContext(2, 1, rate);
@@ -122,6 +122,16 @@ window.enc = {
       for (let c = 0; c < 2; c++) for (let i = 0; i < length; i++) mixed[c][i] += music[c][i];
     }
     const master = loudness === null ? null : normalizeLoudness(mixed, loudness, ceiling);
+    if (wav) {
+      const from = Math.max(0, Math.round(wav.start * rate)), count = Math.min(length - from, Math.round(wav.duration * rate));
+      if (!(count > 0)) throw Error('音频验收区间无效');
+      const bytes = new ArrayBuffer(44 + count * 4), view = new DataView(bytes);
+      const tag = (at, text) => { for (let i=0;i<text.length;i++) view.setUint8(at+i,text.charCodeAt(i)); };
+      tag(0,'RIFF');view.setUint32(4,36+count*4,true);tag(8,'WAVE');tag(12,'fmt ');view.setUint32(16,16,true);view.setUint16(20,1,true);view.setUint16(22,2,true);view.setUint32(24,rate,true);view.setUint32(28,rate*4,true);view.setUint16(32,4,true);view.setUint16(34,16,true);tag(36,'data');view.setUint32(40,count*4,true);
+      let peak=0;
+      for(let i=0;i<count;i++)for(let c=0;c<2;c++){const sample=Math.max(-1,Math.min(1,mixed[c][from+i]));peak=Math.max(peak,Math.abs(sample));view.setInt16(44+(i*2+c)*2,Math.round(sample*(sample<0?32768:32767)),true);}
+      return {wav:await b64(bytes),sampleRate:rate,channels:2,frames:count,peak,skipped:[...skipped],master};
+    }
     const chunks = [];
     let described = null, broken = null;
     const encoder = new AudioEncoder({ output: (chunk, meta) => { if (meta?.decoderConfig?.description) described = meta.decoderConfig.description; chunks.push(chunk); }, error: (e) => { broken = e; } });

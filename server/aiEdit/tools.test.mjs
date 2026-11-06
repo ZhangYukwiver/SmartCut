@@ -292,7 +292,9 @@ describe("AI edit tools", () => {
 
   it("cover every ProjectStore edit method and convert seconds and media ids", async () => {
     const { run, calls } = runnerWith();
-    const offline = new Set(["remove_image_background", "inspect_image", "repair_image_regions", "extract_reference_frame", "review_video_frames", "review_video_clip", "get_page_candidates", "preview_page", "analyze_reference", "replicate_reference", "refine_reference", "add_drawing_clip", "update_drawing_clip", "detect_beats", "write_page", "read_page", "write_shared_file", "import_shared_file", "read_shared_file", "review_timeline", "export_cover", "make_sound_effects", "check_output", "generate_image", "generate_video", "transcribe_subtitles", ...SKILL_TOOLS]);
+    const offline = new Set(["remove_image_background", "inspect_image", "repair_image_regions", "extract_reference_frame", "review_video_frames", "review_video_clip", "check_page_bounds", "get_page_candidates", "preview_page", "analyze_reference", "replicate_reference", "refine_reference", "add_drawing_clip", "update_drawing_clip", "detect_beats", "track_camera", "write_page", "read_page", "write_shared_file", "import_shared_file", "read_shared_file", "review_timeline", "export_cover", "make_sound_effects", "check_output", "generate_image", "generate_video", "transcribe_subtitles", "transcribe_lyrics", ...SKILL_TOOLS]);
+    offline.add("track_subject");
+    offline.add("build_subject_background");
     expect(TOOL_NAMES.filter((name) => !offline.has(name)).sort()).toEqual(Object.keys(SAMPLE_ARGS).sort());
     for (const [name, args] of Object.entries(SAMPLE_ARGS)) {
       const { result, action } = await run(name, JSON.stringify(args));
