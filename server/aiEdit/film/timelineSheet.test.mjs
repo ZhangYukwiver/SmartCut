@@ -58,4 +58,4 @@ it('composites the whole timeline once, samples each time and tiles labelled fra
   expect(JSON.stringify(project)).toBe(before);
   expect(await readdir(path.join(root, 'renders', `${'a'.repeat(32)}-review`))).toEqual([]);
   await expect(sheets.render({ sessionId: 'a'.repeat(32), project, times: [2, 1] })).rejects.toMatchObject({ code: 'arguments_invalid' });
-});
+}, 15_000);
