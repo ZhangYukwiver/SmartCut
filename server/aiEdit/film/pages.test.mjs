@@ -27,6 +27,7 @@ async function fixture({ unstable = false, controller } = {}) {
   const green = await sharp({ create: { width: 32, height: 24, channels: 3, background: '#22cc44' } }).png().toBuffer();
   const seeks = []; let time = 0, shots = 0;
   const tab = { meta: { duration: 10.2 }, problems: [], close: vi.fn(async () => {}),
+    evaluate:async()=>({applicable:false,status:'pass',reports:[]}),
     seek: async t => { time = t; seeks.push(t); },
     capture: async () => { controller?.abort(); shots++; return time === 0 || (unstable && shots > 2) ? dark : green; } };
   openTab.mockResolvedValue(tab);

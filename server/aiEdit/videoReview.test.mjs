@@ -3,8 +3,9 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, expect, it } from 'vitest';
 import { pageCandidates } from './pageCandidates.mjs';
-import { reviewVideoClip, parseVideoReview, requireCurrentVideoReview } from './videoReview.mjs';
+import { reviewVideoClip, parseVideoReview, parseGoalReview, requireCurrentVideoReview } from './videoReview.mjs';
 import { reviewHash } from './film/reviewClips.mjs';
+import { TOOL_CONTENT } from './toolContent.mjs';
 
 const roots = [];
 afterEach(async () => { await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true }))); });
@@ -100,4 +101,67 @@ it('retains only six candidates without changing their exact HTML or another ses
   for (let i = 0; i < 7; i++) await f.ctx.candidates.add({ ...f.candidate, html: `candidate${i}` });
   expect(await f.ctx.candidates.list()).toHaveLength(6);
   expect(await readFile(path.join(f.root, 'candidates', 'a'.repeat(32), (await f.ctx.candidates.list())[0].id + '.json'), 'utf8')).toContain('candidate');
+});
+
+it('keeps relative improvement separate from unmet goals, and refuses delivery after frame-level overflow', async () => {
+  const f = await fixture();
+  f.ctx.userRequest = '把文字放在透明弧面上';
+  f.ctx.store.getProject = async () => ({ canvas: f.candidate.canvas, tracks: [{ segments: [{ id: 'clip', path: 'overlay', source: { start_us: 0 }, timeline: { start_us: 0, duration_us: 10_200_000 } }] }] });
+  f.ctx.library.idForPath = x => x;
+  f.ctx.library.get = () => ({ kind: 'video', width: 1920, height: 3792, durationUs: 25_783_333, source: { pageId: f.candidate.pageId } });
+  const scene = { key: 'scene', clipId: 'clip', start: 0 };
+  f.ctx.reviewClips.composition = async () => scene;
+  const render = f.ctx.reviewClips.render;
+  f.ctx.reviewClips.render = async s => ({ ...await render(s), composition: s.project ? scene : undefined });
+  f.ctx.reviewClips.inspect = async s => {
+    expect(s.fps).toBe(60); expect(s.duration).toBe(10.2); expect(s.audit).toBe(true);
+    return { composition: scene, boundaries: { status: 'fail', start: 0, duration: 10.2, fps: 60, checked_frames: 612, violating_frames: 1 },
+      boundary_file: 'report.json', images: [{ time: 0, file: 'frame.jpg', url: 'data:image/jpeg;base64,YQ==' }] };
+  };
+  f.ctx.vision.ask = async req => { f.requests.push(req); return JSON.stringify(f.requests.length === 1 ? assessment : { summary: '文字悬浮', remaining: ['修正曲面关系'], criteria: [{ requirement: '文字贴合弧面', status: 'fail', evidence: '后半段文字悬浮在弧面外' }] }); };
+  const result = await reviewVideoClip(f.ctx, { preview_id: f.candidate.id, start: 0, duration: 10.2, mode: 'goal' });
+  expect(result.protocol_retries).toBe(1);
+  expect(result.assessment.decision).toBe('not_compared');
+  expect(result.assessment.ready_to_adopt).toBe(false);
+  expect(f.requests[0].videos.some(p => p.text?.includes('BASELINE'))).toBe(false);
+  expect(f.requests[1].prompt).toContain('校正');
+  expect(result.assessment.goal.status).toBe('fail');
+  expect(result.assessment.ready_to_deliver).toBe(false);
+  expect(result.boundaries.violating_frames).toBe(1);
+  expect(result[TOOL_CONTENT].filter(p => p.type === 'image')).toHaveLength(1);
+  expect(f.requests[0].prompt).toContain(f.ctx.userRequest);
+  expect((await f.ctx.candidates.get(f.candidate.id)).boundaryCheck.boundaries.checked_frames).toBe(612);
+  f.ctx.vision.ask = async () => JSON.stringify({ summary: '贴合', remaining: [], criteria: [{ requirement: '文字贴合弧面', status: 'pass', evidence: '全部时段贴合' }] });
+  const falselyPassed = await reviewVideoClip(f.ctx, { preview_id: f.candidate.id, start: 0, duration: 10.2, mode: 'goal', instructions: '再判断' });
+  expect(falselyPassed.assessment.goal.status).toBe('fail');
+  expect(falselyPassed.assessment.ready_to_deliver).toBe(false);
+});
+
+it('uses the live goal for goal prompts, delivery, and cache identity', async () => {
+  const f = await fixture();
+  f.ctx.userRequest = '';
+  let goal = '当前目标：文字贴合透明弧面';
+  f.ctx.getGoal = () => goal;
+  f.ctx.store.getProject = async () => ({ canvas: f.candidate.canvas, tracks: [{ segments: [{ id: 'clip', path: 'overlay', source: { start_us: 0 }, timeline: { start_us: 0, duration_us: 10_200_000 } }] }] });
+  f.ctx.library.idForPath = x => x;
+  f.ctx.library.get = () => ({ kind: 'video', width: 1920, height: 3792, durationUs: 25_783_333, source: { pageId: f.candidate.pageId } });
+  const scene = { key: 'scene', clipId: 'clip', start: 0 };
+  f.ctx.reviewClips.composition = async () => scene;
+  const render = f.ctx.reviewClips.render;
+  f.ctx.reviewClips.render = async source => ({ ...await render(source), composition: source.project ? scene : undefined });
+  f.ctx.reviewClips.inspect = async () => ({ composition: scene, boundaries: { status: 'pass', start: 0, duration: 10.2, fps: 60, checked_frames: 612, violating_frames: 0 }, boundary_file: 'report.json', images: [] });
+  f.ctx.vision.ask = async request => { f.requests.push(request); return JSON.stringify({ summary: '贴合', remaining: [], criteria: [{ requirement: '文字贴合弧面', status: 'pass', evidence: '完整时段贴合' }] }); };
+  const first = await reviewVideoClip(f.ctx, { preview_id: f.candidate.id, start: 0, duration: 10.2, mode: 'goal' });
+  expect(first.assessment.ready_to_deliver).toBe(true);
+  expect(f.requests[0].prompt).toContain(goal);
+  goal = '后续目标';
+  const second = await reviewVideoClip(f.ctx, { preview_id: f.candidate.id, start: 0, duration: 10.2, mode: 'goal' });
+  expect(second.cached).toBe(false);
+  expect(f.requests).toHaveLength(2);
+});
+
+it('rejects a comparison verdict or empty goal list instead of recording successful goal verification', () => {
+  expect(() => parseGoalReview(JSON.stringify(assessment))).toThrow('逐项');
+  expect(() => parseGoalReview(JSON.stringify({ summary: '好了', criteria: [], remaining: [] }))).toThrow('逐项');
+  expect(parseGoalReview(JSON.stringify({ summary: '待核实', remaining: ['未听音轨'], criteria: [{ requirement: '同步', status: 'uncertain', evidence: '视频无音轨' }] })).goal.status).toBe('uncertain');
 });

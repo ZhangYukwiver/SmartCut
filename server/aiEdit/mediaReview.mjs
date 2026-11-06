@@ -39,7 +39,7 @@ async function frames(ctx, item, at, crop) {
   return result.assets;
 }
 
-async function review(ctx, { times, actual, expected, referenceTimes, instructions, diagnostics = [], problems = [], baseline, baselineNote }) {
+async function review(ctx, { times, actual, expected, referenceTimes, instructions, diagnostics = [], problems = [], baseline, baselineNote, composition }) {
   const parts = times.flatMap((t, i) => [
     ...(expected ? [{ type: 'text', text: `第 ${i + 1} 组，REFERENCE 原片 ${referenceTimes[i]} 秒：` },
       { type: 'image_url', image_url: { url: expected[i], detail: 'high' } }] : []),
@@ -53,6 +53,7 @@ async function review(ctx, { times, actual, expected, referenceTimes, instructio
 ${expected ? '逐组比较 REFERENCE 与 RENDER，不能把两者弄反。' : '检查 RENDER 的实际画面。'}这是选定时刻的抽样，不代表全片逐帧检查，也没有听音轨。
 ${baseline ? `每组已提供同一秒数、同一裁切的 BASELINE 修改前正式版。先逐组比较 BASELINE 与 RENDER，明确“改善/退步/基本不变/无法判断”及可见依据，再单独判断与 REFERENCE 的剩余差距。仍有差距不等于本次没有改善；不得说未提供旧版。若部分变好、部分退步，分别列出，不能用平均改善掩盖回退。BASELINE 是正式版，不是上一份未保存候选；没有那份候选时不要推断相邻轮次的趋势。修改前的加载/脚本问题：${JSON.stringify(baseline.problems)}；重画检查：${JSON.stringify(baseline.diagnostics)}。有异常时说明比较的限制。` : ''}
 ${baselineNote || ''}
+${composition ? 'RENDER 和 BASELINE 均为当前时间线完整合成，包含底层视频与其他图层。diagnostics来自单独网页图层；其中nearly_black对透明层不代表合成后黑场。' : ''}
 先给结论（明显不符/接近但有差异/当前材料无法判断），再按时间写可见的布局、主体位置和大小、遮挡、文字及纹理差异。静帧不能证明区域在滑动、镜头在推进或窗口会触发内部视频；不能把合成机制推断当成事实，运动问题交给连续视频复核。
 需要定位时给裁切后画面中归一化的边界或中心，区分实测可见与推断。不要因程序能运行、图层多或用了三维投影就说还原成功。
 最后只对有可见依据的问题给不超过 5 项修改建议，区分素材、布局、遮挡和时间关系；没有依据时明确不足，不为凑建议猜测UV或重写动画，不虚构未看到的运动。
@@ -92,14 +93,28 @@ export async function previewPage(ctx, args) {
   const reference = reference_media_id ? source(ctx, reference_media_id, referenceTimes) : null;
   const result = await ctx.pages.preview({ ...page, times, crop,
     reference: reference ? { media_id: reference_media_id, offset: reference_offset, crop, reference_crop } : undefined });
-  if (args.transparent ?? existing?.source?.transparent ?? false) {
+  let composite = null;
+  if (args.page_id && ctx.reviewClips?.inspect) {
+    const project = await ctx.store.getProject(ctx.projectId), candidate = await ctx.candidates.get(result.preview_id);
+    const source = { sessionId: ctx.sessionId, pageId: args.page_id, html: candidate.html, project, clipId: args.clip_id,
+      ...project.canvas, start: times[0], duration: Math.min(result.duration - times[0], times.at(-1) - times[0] + 1 / project.canvas.fps), times, crop, signal: ctx.signal };
+    const scene = await ctx.reviewClips.composition(source);
+    if (scene) {
+      composite = await ctx.reviewClips.inspect(source);
+      if (composite.composition?.key !== scene.key) throw new AiEditError('page_conflict', '合成检查期间时间线改变，请重新预览。', 409);
+      result.images = composite.images.map(i => i.url);
+      if (result.baseline) result.baseline.images = (await ctx.reviewClips.inspect({ ...source, html: candidate.original })).images.map(i => i.url);
+    }
+  }
+  if ((args.transparent ?? existing?.source?.transparent ?? false) && !composite) {
     return { preview_id: result.preview_id, duration: result.duration, diagnostics: result.diagnostics, problems: result.problems,
       samples: times.map(time => ({ time })), review: '已完成透明页面的脚本和重画检查，尚未评判合成效果。',
-      note: '透明层单独铺黑底的图片不能呈现底层内容，本次不请求静帧视觉评审。用 review_video_clip 在当前时间线连同底层复核；不要因 nearly_black 给遮罩添加贴图或改动底片。' };
+      note: '透明层还没有对应时间线合成，本次不请求静帧视觉评审。先保存初稿并放上时间线，再用 preview_page(page_id) 获取完整合成截图。不要因 nearly_black 给遮罩添加贴图或改动底片。' };
   }
   const expected = reference ? await frames(ctx, reference, referenceTimes, reference_crop) : null;
-  const checked = await review(ctx, { times, actual: result.images, expected, referenceTimes, instructions, diagnostics: result.diagnostics, problems: result.problems, baseline: result.baseline, baselineNote: result.baseline_note });
+  const checked = await review(ctx, { times, actual: result.images, expected, referenceTimes, instructions, diagnostics: result.diagnostics, problems: result.problems, baseline: result.baseline, baselineNote: result.baseline_note, composition: composite?.composition });
   return { ...checked, preview_id: result.preview_id, duration: result.duration, diagnostics: result.diagnostics, problems: result.problems,
+    ...(composite ? { composition: composite.composition, frames: composite.images.map(({ time, file }) => ({ time, file })) } : {}),
     note: '候选仅作真实关键帧预览，未编码、未入库、未改正式页面。确认改善后用 write_page 的 preview_id 保存本次同一份候选；仍需检查完整渲染的过渡。' };
 }
 

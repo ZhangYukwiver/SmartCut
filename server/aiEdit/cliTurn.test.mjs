@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { createLocalAi } from "../localAi.mjs";
 import { compactHistory, parseEditConfig, runConversation, sealHistory } from "./chat.mjs";
 import { CLI_SYSTEM_NOTE, renderTranscript, runCliConversation } from "./cliTurn.mjs";
+import { runReviewedConversation } from './reviewTurn.mjs';
 
 const FAKE = path.join(path.dirname(fileURLToPath(import.meta.url)), "../fixtures/local-ai/fake-cli.mjs");
 const tool = (name) => ({ type: "function", function: { name, description: name, parameters: { type: "object", properties: {} } } });
@@ -44,6 +45,30 @@ const turn = (overrides) => ({
 });
 
 describe("talking a local CLI through a turn", () => {
+  for (const runtime of ['codex', 'claude']) it(`${runtime}: automatically continues a failed review through a fresh CLI without a new user message`, async () => {
+    const { ai, records, setPlan } = await fakeAi({ steps: [{ call: 'get_timeline' }, { say: '已经完成' }] });
+    let corrected = false;
+    const history = [{ role: 'user', content: '原始剪辑要求' }], limits = [];
+    const result = await runReviewedConversation({
+      ...turn({ config: { runtime, model: '', videoInput: false }, history, localAi: ai }),
+      maxToolCalls: 5,
+      converse: args => { limits.push(args.maxToolCalls); return runCliConversation(args); },
+      reviewGate: { check: async () => corrected ? null : { fingerprint: 'failed-draft', prompt: '曲面未贴合，请修改并复核' } },
+      execute: async call => { if (call.name === 'add_text_clip') corrected = true; return { ok: true }; },
+      onContinue: async () => setPlan({ steps: [{ call: 'add_text_clip' }, { say: '修改并复核完成' }] }),
+    });
+    expect(result).toEqual({ text: '修改并复核完成', toolCalls: 2 });
+    expect(limits).toEqual([5, 4]);
+    expect(history.filter(e => e.role === 'user')).toHaveLength(1);
+    const executions = await records();
+    expect(executions).toHaveLength(2);
+    const prompt = runtime === 'claude' ? JSON.parse(executions[1].stdin).message.content[0].text : executions[1].stdin;
+    expect(prompt).toContain('用户：原始剪辑要求');
+    expect(prompt).toContain('应用自主验收反馈，不是用户追加消息');
+    expect(prompt).toContain('曲面未贴合');
+    expect(prompt).not.toContain('【用户最新的消息】\n已经完成');
+  });
+
   it("parses a local runtime config without a key", () => {
     expect(parseEditConfig({ runtime: "claude", model: "sonnet", apiKey: "old-key", baseUrl: "https://x" })).toEqual({ runtime: "claude", model: "sonnet", videoInput: false });
     expect(() => parseEditConfig({ runtime: "nope", baseUrl: "https://x" })).toThrow(/Key/u);

@@ -7,6 +7,7 @@ import { renameRetrying } from "../rename.mjs";
 import { modelFetch } from "../../systemProxy.mjs";
 import { openTab } from "./browser.mjs";
 import { encodeMp4, writePngMov } from "./encoder.mjs";
+import { SUBJECT_AUDIT_READ } from "../subjectAudit.mjs";
 
 // 网页片段（openfilm 的「页面」）：一个 HTML 文件，window.film.frame(t) 画出任意时刻。存在 ai-edit/pages/<page_id>/，
 // 渲成视频放进素材库（不透明的 H.264 MP4，带透明的 PNG MOV），所以时间线、剪映草稿、裁剪切分都把它当普通视频；
@@ -231,7 +232,8 @@ export function createPages({ root, library, files, provider, getOrigin }) {
         // renderedAt：看板的 iframe 地址带上它，改写后的网页不吃缓存
         source: { type: "page", page: rel, ...(pageId ? { pageId } : {}), ...(reference ? { reference } : {}), transparent: Boolean(transparent), renderedAt: Date.now() },
       });
-      return { item, problems, duration: seconds };
+      const subjectAudit=await tab.evaluate(SUBJECT_AUDIT_READ);
+      return { item, problems, duration: seconds, ...(subjectAudit?.applicable?{subjectAudit}:{}) };
     } catch (error) {
       await rm(temp, { force: true }).catch(() => undefined);
       if (error instanceof AiEditError || error?.name === "AbortError") throw error;
@@ -311,7 +313,8 @@ export function createPages({ root, library, files, provider, getOrigin }) {
           diagnostics[i].unstable = delta > UNSTEADY;
         }
         signal?.throwIfAborted();
-        return { images, duration, diagnostics, problems: [...tab.problems] };
+        const subjectAudit=await tab.evaluate(SUBJECT_AUDIT_READ);
+        return { images, duration, diagnostics, problems: [...tab.problems], ...(subjectAudit?.applicable?{subjectAudit}:{}) };
       } finally {
         await tab?.close().catch(() => undefined);
         await rm(pageId ? file : folder, { recursive: !pageId, force: true });

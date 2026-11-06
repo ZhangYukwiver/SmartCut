@@ -143,7 +143,7 @@ describe("transcribe_subtitles against the real project store", () => {
       const music = (await ok("add_media_clip", { track_id: audio, media_id: tone, start: 0, duration: 1 })).clip_id;
       const { result, action } = await run("transcribe_subtitles", { clip_ids: [first, second, music] });
       expect(result).toMatchObject({ ok: true, track_id: expect.any(String), note: expect.stringContaining("转写了 3 句台词") });
-      expect(result.note).toContain("是音频，现在只能转写视频里的声音");
+      expect(result.note).toContain("transcribe_lyrics");
       expect(action.summary).toBe("把 3 段视频里的台词转写成字幕");
       expect(requests).toHaveLength(1);
       expect(requests[0].url).toBe("https://ark.example.com/api/v3/chat/completions");

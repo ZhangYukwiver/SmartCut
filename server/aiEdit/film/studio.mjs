@@ -9,7 +9,7 @@ import { Unzip, UnzipInflate, Zip, ZipDeflate, ZipPassThrough } from "fflate";
 import { AiEditError } from "../library.mjs";
 import { openTab } from "./browser.mjs";
 import { QUALITY_BITS, encodeMp4 } from "./encoder.mjs";
-import { volumeAt } from "../clipLook.mjs";
+import { projectSounds } from './soundPlan.mjs';
 import { FILM_FILE, droppedText, filmToPlan, projectToFilm, transformOf } from "./filmFile.mjs";
 import { readMovie } from "./mp4.mjs";
 import { judgeOutput } from "./outputCheck.mjs";
@@ -316,22 +316,10 @@ export function createFilmStudio({ root, library, provider, getOrigin }) {
       try {
         encoder = await openTab(provider, files.urlFor(origin, "__encoder.html"), { plain: true });
         const count = Math.max(1, Math.round(duration * fps));
-        // 声音片段（clip 是片段 id，画面画在小网页里的是「id-audio」）按所在轨道标上旁白 / 让位：旁白轨不跟着自己让位
-        const roles = new Map(project.tracks.flatMap((track) => {
-          const role = track.narration ? "voice" : track.duck ? "duck" : null;
-          return role ? (track.segments ?? []).flatMap((segment) => [[segment.id, role], [`${segment.id}-audio`, role]]) : [];
-        }));
-        // 音量关键帧（连同淡入淡出）每 10 毫秒取一个点，混音时照着走
-        const gainOf = (segment) => {
-          const count = Math.max(2, Math.ceil(segment.timeline.duration_us / 10_000) + 1);
-          return Array.from({ length: count }, (_, index) => Math.round(volumeAt(segment, (index / (count - 1)) * segment.timeline.duration_us) * 1e4) / 1e4);
-        };
         const result = await encodeMp4({
           encoderTab: encoder, file, width, height, fps, count, signal,
           frame: async (index) => { await film.seek(index / fps); return film.capture({ format: "jpeg", quality: 90 }); },
-          sounds: film.meta.sounds.map((sound) => ({
-            ...sound, ...(roles.has(sound.clip) ? { role: roles.get(sound.clip) } : {}), ...(volumes[sound.clip] ? { gain: gainOf(volumes[sound.clip]) } : {}),
-          })),
+          sounds: projectSounds(project, film.meta.sounds, volumes),
           loudness: project.canvas.loudness ?? null,
           bitsPerPixel: QUALITY_BITS[project.canvas.quality] ?? QUALITY_BITS.standard,
           onProgress: (share) => onProgress(share * 0.95),

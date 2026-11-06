@@ -95,13 +95,15 @@ export function renderTranscript(entries, maxChars = TRANSCRIPT_CHARS, onTrimmed
  */
 export async function runCliConversation({
   config, history, tools, system, context, execute, signal, onText = () => undefined, maxToolCalls = MAX_TOOL_CALLS, localAi, goal = () => "",
-  onAction = () => undefined, onTrimmed = () => undefined,
+  onAction = () => undefined, onTrimmed = () => undefined, continuation = '',
 }) {
   const label = LOCAL_RUNTIMES[config.runtime].label;
   if (!localAi) throw new AiEditError("local_runtime_unavailable", "本机 AI 没准备好，请重启应用。", 503);
   const systemPrompt = `${await system()}\n\n${CLI_SYSTEM_NOTE}`;
   const extra = context ? await context() : "";
-  const prompt = [renderTranscript(history.slice(0, -1), TRANSCRIPT_CHARS, onTrimmed), extra, `【用户最新的消息】\n${history.at(-1)?.content ?? ""}`].filter(Boolean).join("\n\n");
+  const prompt = continuation
+    ? [renderTranscript(history, TRANSCRIPT_CHARS, onTrimmed), extra].filter(Boolean).join('\n\n')
+    : [renderTranscript(history.slice(0, -1), TRANSCRIPT_CHARS, onTrimmed), extra, `【用户最新的消息】\n${history.at(-1)?.content ?? ""}`].filter(Boolean).join("\n\n");
   if (history.at(-1)?.attachments?.length) onAction({ ...SEE_IMAGES_ACTION, summary: `${label} 这里看不了图片，只告诉了它图片的名字` });
 
   const parts = [];

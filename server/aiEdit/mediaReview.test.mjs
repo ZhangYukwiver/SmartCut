@@ -77,6 +77,24 @@ describe('review rendered video frames', () => {
     expect(requests).toHaveLength(0); expect(analyses).toHaveLength(0);
   });
 
+  it('returns full timeline composite images directly to the editing model for transparent pages', async () => {
+    const { ctx, analyses } = fixture();
+    ctx.sessionId = 'session'; ctx.projectId = 'project';
+    ctx.library.list = () => [{ source: { pageId: 'mask', transparent: true } }];
+    ctx.store = { getProject: async () => ({ canvas: { width: 1920, height: 1080, fps: 30 } }) };
+    ctx.pages = { preview: async () => ({ images: ['data:image/jpeg;base64,YQ=='], preview_id: 'overlay', duration: 8, problems: [], diagnostics: [],
+      baseline: { images: ['data:image/jpeg;base64,Yg=='], problems: [], diagnostics: [] } }) };
+    ctx.candidates = { get: async () => ({ html: 'candidate', original: 'original' }) };
+    const scene = { key: 'scene', clipId: 'clip', start: 1 };
+    ctx.reviewClips = { composition: async () => scene, inspect: async ({ html }) => ({ composition: scene,
+      images: [{ time: 1, file: `${html}.jpg`, url: `data:image/jpeg;base64,${html === 'candidate' ? 'Yw==' : 'ZA=='}` }] }) };
+    const result = await previewPage(ctx, { page_id: 'mask', times: [1] });
+    expect(result.composition).toEqual(scene);
+    expect(result[TOOL_CONTENT].filter(p => p.type === 'image').map(p => p.data)).toEqual(['ZA==', 'Yw==']);
+    expect(analyses[0].prompt).toContain('当前时间线完整合成');
+    expect(JSON.stringify(result)).not.toContain('base64');
+  });
+
   it('compares exact time pairs in reference/render order, retaining crop and fresh renders', async () => {
     const { ctx, requests, analyses } = fixture();
     const args = { media_id: 'render', times: [1, 4, 9], crop, reference_media_id: 'reference', reference_offset: 2.8 };

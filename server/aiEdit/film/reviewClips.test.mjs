@@ -11,6 +11,16 @@ vi.mock('./encoder.mjs', () => ({ encodeMp4: vi.fn() }));
 const roots = [];
 afterEach(async () => { vi.resetAllMocks(); await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true }))); });
 
+it('rejects raw media outside the media directory, including sibling directories with the same prefix', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'review-boundary-')); roots.push(root);
+  const clips = createReviewClips({ root, provider: {}, files: { urlFor: (_, rel) => rel }, getOrigin: () => '' });
+  for (const mediaFile of [path.join(root, 'outside.mp4'), path.join(root, 'media-other', 'clip.mp4')]) {
+    await expect(clips.render({ sessionId: 'a'.repeat(32), mediaFile, sourceDuration: 1, width: 64, height: 36, start: 0, duration: .5 }))
+      .rejects.toMatchObject({ code: 'arguments_invalid', message: '复核素材来源无效。' });
+  }
+  expect(openTab).not.toHaveBeenCalled();
+});
+
 it('renders only the requested interval at the original clock, caches the clip and preserves the formal page', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'review-clip-')); roots.push(root);
   const pageId = 'b'.repeat(16), folder = path.join(root, 'pages', pageId); await mkdir(folder, { recursive: true });

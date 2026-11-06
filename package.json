@@ -79,6 +79,9 @@
     ],
     "asar": true,
     "asarUnpack": [
+      "server/aiEdit/cameraTrackWorker.py",
+      "server/aiEdit/subjectBackgroundWorker.py",
+      "server/aiEdit/lyricsWorker.py",
       "node_modules/playwright-core/**/*",
       "node_modules/onnxruntime-node/bin/**/*",
       "node_modules/@img/**/*"

@@ -1,10 +1,11 @@
 import { existsSync } from "node:fs";
-import { copyFile, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { createServer, request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
+import sharp from 'sharp';
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { createLocalAi } from "../localAi.mjs";
@@ -113,10 +114,10 @@ function fakeDraftBox(overrides = {}) {
 }
 
 /** 只说 CDP 的假渲染浏览器：页面一开就加载完，window.film 时长 0.1 秒（3 帧），截图回几个字节，编码页每帧回一个关键帧。 */
-function fakeFilmBrowser(screenshot = Buffer.from("fake screenshot bytes")) {
+function fakeFilmBrowser(screenshot = Buffer.from("fake screenshot bytes"), duration = 0.1) {
   const value = (expression) => {
     if (expression.startsWith("Boolean(window.film")) return true;
-    if (expression.includes("a.ready")) return { duration: 0.1, width: 64, height: 36, sounds: [] };
+    if (expression.includes("a.ready")) return { duration, width: 64, height: 36, sounds: [] };
     if (expression.includes("enc.frame")) return [{ data: Buffer.from("frame").toString("base64"), key: true, ts: 0 }];
     if (expression.includes("enc.finish")) return { chunks: [], description: Buffer.from("avcC").toString("base64") };
     return null;
@@ -255,6 +256,53 @@ async function uploadFixture(call, name, as = name) {
 // ---------- 测试 ----------
 
 describe("AI edit help from the open page", () => {
+  it("reviews raw media and timeline overlays when the data directory is a symlink", async () => {
+    const parent = await temporaryDirectory('ai-edit-alias-');
+    const actual = path.join(parent, 'actual'), alias = path.join(parent, 'alias');
+    await mkdir(actual);
+    await symlink(actual, alias, process.platform === 'win32' ? 'junction' : 'dir');
+    let mediaId, pageId, overlayId, overlayClip, phase = 0, reviews = 0;
+    const html = '<script>window.film={duration:.5,frame(){}}</script>';
+    const fetchImpl = async (_url, init) => {
+      const body = JSON.parse(init.body);
+      if (!body.tools) {
+        const parts = body.messages.flatMap(m => Array.isArray(m.content) ? m.content : []);
+        if (!parts.some(p => p.type === 'video_url')) {
+          expect(parts.some(p => p.type === 'image_url')).toBe(true);
+          return textReply('叠加预览画面可见。');
+        }
+        reviews++;
+        return textReply(JSON.stringify({ decision: 'unchanged', summary: 'reviewed', evidence: ['continuous frames'], regressions: [], remaining: [], ready_to_adopt: false }));
+      }
+      const result = phase ? lastToolResult(body) : null;
+      if (result) expect(result, JSON.stringify(result)).toMatchObject({ ok: true });
+      switch (++phase) {
+        case 1: return toolReply([{ name: 'review_video_clip', args: { media_id: mediaId, start: 0, duration: .5 } }]);
+        case 2: return toolReply([{ name: 'write_page', args: { title: 'overlay', html, transparent: true } }]);
+        case 3: pageId = result.page_id; overlayId = result.media_id; return toolReply([{ name: 'create_track', args: { track_type: 'video' } }]);
+        case 4: return toolReply([{ name: 'add_media_clip', args: { track_id: result.track_id, media_id: mediaId, duration: .5 } }]);
+        case 5: return toolReply([{ name: 'create_track', args: { track_type: 'video' } }]);
+        case 6: return toolReply([{ name: 'add_media_clip', args: { track_id: result.track_id, media_id: overlayId, duration: .5 } }]);
+        case 7: overlayClip = result.clip_id; return toolReply([{ name: 'preview_page', args: { page_id: pageId, html, times: [.1] } }]);
+        case 8: return toolReply([{ name: 'review_video_clip', args: { preview_id: result.preview_id, clip_id: overlayClip, start: 0, duration: .5 } }]);
+        default: expect(result.composition).toMatchObject({ clipId: overlayClip }); return textReply('复核完成');
+      }
+    };
+    const screenshot = await sharp({ create: { width: 64, height: 36, channels: 3, background: '#339966' } }).png().toBuffer();
+    const { call, waitIdle } = await start({ dataDirectory: alias, fetchImpl,
+      probe: async file => ({ ...await probe(file), width: 64, height: 36 }),
+      filmBrowser: fakeFilmBrowser(screenshot, .5), getOrigin: () => 'http://127.0.0.1:9' });
+    mediaId = (await uploadFixture(call, 'clip-720p.mp4')).body.item.id;
+    const { session } = (await call('/v1/ai-edit/sessions', { method: 'POST', body: { canvas: { width: 64, height: 36 } } })).body;
+    await call(`/v1/ai-edit/sessions/${session.id}/messages`, { method: 'POST', body: { text: '复核视频与叠加', config: { ...CONFIG, videoInput: true } } });
+    const done = await waitIdle(session.id);
+    expect(done.session.error).toBeNull();
+    expect(reviews).toBe(2);
+    expect(done.session.messages.at(-1).actions.filter(a => a.name === 'review_video_clip')).toEqual([
+      expect.objectContaining({ ok: true }), expect.objectContaining({ ok: true }),
+    ]);
+  });
+
   it("uses the required editing model when optional analysis configuration is invalid and persists visual usage", async () => {
     let mediaId, planned = 0;
     const calls = [];
@@ -326,9 +374,10 @@ describe("AI edit help from the open page", () => {
       expect(lastToolResult(body)).toMatchObject({ ok: true, page_id: pageId });
       return textReply('按用户要求保存跨轮候选');
     };
-    const { call, waitIdle, until, store, directory } = await start({ fetchImpl, filmBrowser: fakeFilmBrowser(await readFile(path.join(FIXTURES, 'still.png'))), getOrigin: () => 'http://127.0.0.1:9' });
+    const screenshot = await sharp(path.join(FIXTURES, 'still.png')).resize(64, 36).png().toBuffer();
+    const { call, waitIdle, until, store, directory } = await start({ fetchImpl, filmBrowser: fakeFilmBrowser(screenshot), getOrigin: () => 'http://127.0.0.1:9' });
     referenceId = (await uploadFixture(call, 'clip-720p.mp4')).body.item.id;
-    const { session, project } = (await call('/v1/ai-edit/sessions', { method: 'POST', body: {} })).body;
+    const { session, project } = (await call('/v1/ai-edit/sessions', { method: 'POST', body: { canvas: { width: 64, height: 36 } } })).body;
     const send = (text, refine = false) => call(`/v1/ai-edit/sessions/${session.id}/messages`, { method: 'POST', body: { text, config: CONFIG, refine } });
     await send('制作动画'); await waitIdle(session.id);
     const made = lastToolResult(requests[1]);

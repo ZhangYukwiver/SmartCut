@@ -185,6 +185,10 @@ const OMITTED = "较早的内容，细节已省略；还要用就用同样的参
 const OMITTED_ARGUMENTS = "较早的参数，细节已省略";
 // 这几个工具的结果后面还用得上（拆解结论、技能说明和命令输出）：压缩和本机 CLI 转述时都留开头这么多字
 export const KEEP_RESULT = {
+  track_subject: 4_000,
+  track_camera: 4_000,
+  transcribe_lyrics: 8_000,
+  check_page_bounds: 6_000,
   analyze_reference: 6_000, review_video_frames: 6_000, review_video_clip: 6_000, review_timeline: 6_000, check_output: 3_000, get_page_candidates: 6_000, preview_page: 6_000, inspect_image: 3_000, repair_image_regions: 3_000, read_skill: 6_000, run_skill_command: 2_000, skill_job: 1_500,
 };
 
