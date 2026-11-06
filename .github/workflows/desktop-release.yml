@@ -78,6 +78,7 @@ jobs:
         run: |
           node scripts/verify-release-package.mjs 'release/mac-arm64/SmartCut.app/Contents/Resources'
           test "$(lipo -archs 'release/mac-arm64/SmartCut.app/Contents/MacOS/SmartCut')" = arm64
+          test "$(lipo -archs 'release/mac-arm64/SmartCut.app/Contents/Resources/smartcut-subject')" = arm64
       - name: Upload Windows installer
         if: runner.os == 'Windows'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

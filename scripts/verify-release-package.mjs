@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
-import { readdir, readFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { access, readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -126,7 +127,7 @@ export async function verifyReleasePackage(resourcesDirectory, { sourceDirectory
 
   for (const relative of await filesUnder(resources)) {
     assertPublicPackagePath(relative);
-    assert(relative === "app.asar" || relative === "app-update.yml" || relative === "default_app.asar" || relative === "elevate.exe" || relative === "icon.icns" || /^[^/]+\.lproj\/(?:locale\.pak|InfoPlist\.strings)$/.test(relative) || relative.startsWith("app.asar.unpacked/"), `Unexpected resource: ${relative}`);
+    assert(relative === "app.asar" || relative === "app-update.yml" || relative === "default_app.asar" || relative === "elevate.exe" || relative === "icon.icns" || (process.platform === "darwin" && relative === "smartcut-subject") || /^[^/]+\.lproj\/(?:locale\.pak|InfoPlist\.strings)$/.test(relative) || relative.startsWith("app.asar.unpacked/"), `Unexpected resource: ${relative}`);
     if (relative === "app-update.yml") {
       assertPublicUpdateMetadata(await readFile(path.join(resources, relative), "utf8"), sourcePackage.name);
     }
@@ -139,6 +140,7 @@ export async function verifyReleasePackage(resourcesDirectory, { sourceDirectory
       assert.equal(statFile(archive, archiveRelative).unpacked, true, `Untracked unpacked resource: ${relative}`);
     }
   }
+  if (process.platform === "darwin") await access(path.join(resources, "smartcut-subject"), constants.X_OK);
   return { version: packedPackage.version, webFiles: distFiles.length };
 }
 
