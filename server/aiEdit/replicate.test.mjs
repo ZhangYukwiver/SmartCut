@@ -49,6 +49,13 @@ describe('reference to editable timeline', () => {
     expect(d.keys[0].t).toBe(0);
     expect(d.steps[1].parts[0].keys[0].t).toBe(0);
   });
+  it('keeps the interactive first version without requesting visual corrections', async () => {
+    const t = await setup({ firstPassOnly: true });
+    const { result } = await t.run('replicate_reference', { media_id: t.item.id });
+    expect(result.ok).toBe(true);
+    expect(t.asked.map(job => job.kind)).toEqual(['replica', 'replica-review', 'extract']);
+    expect(result.verification.candidates).toEqual([]);
+  });
   it('creates independent editable layers and original audio in one persisted revision, then edits one mask only', async () => {
     const t = await setup();
     const result = await t.run('replicate_reference', { media_id: t.item.id });

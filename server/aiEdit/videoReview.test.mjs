@@ -24,6 +24,27 @@ async function fixture() {
   return { root, ctx, candidate, requests, renders, args: { preview_id: candidate.id, start: 3.8, duration: 2.2 } };
 }
 
+it('checks the complete native timeline against the user goal without a reference or page', async () => {
+  const f = await fixture();
+  f.ctx.userRequest = '片尾淡出';
+  f.ctx.finalReview = true;
+  const project = { canvas: f.candidate.canvas, tracks: [{ segments: [{ timeline: { start_us: 0, duration_us: 2e6 } }] }] };
+  const scene = { key: 'formal', start: 0 };
+  f.ctx.store.getProject = async () => project;
+  f.ctx.reviewClips.composition = async s => { expect(s.timeline).toBe(true); return scene; };
+  const render = f.ctx.reviewClips.render;
+  f.ctx.reviewClips.render = async s => ({ ...await render(s), composition: scene });
+  f.ctx.reviewClips.inspect = async () => ({ composition: scene, images: [],
+    boundaries: { start: 0, duration: 2, status: 'uncertain', frames_with_text: 0, limitations: [] } });
+  f.ctx.vision.ask = async req => {
+    expect(req.videos.filter(p => p.type === 'video_url')).toHaveLength(1);
+    return JSON.stringify({ summary: '片尾逐渐变暗', criteria: [{ requirement: '片尾淡出', status: 'pass', evidence: '最后半秒逐渐变暗' }], remaining: [] });
+  };
+  const r = await reviewVideoClip(f.ctx, { timeline: true, start: 0, duration: 2 });
+  expect(r.assessment.ready_to_deliver).toBe(true);
+  expect(r.timeline).toBe(true);
+});
+
 it('sends aligned videos, keeps the candidate across turns, reuses identical reviews without another model call', async () => {
   const f = await fixture();
   const first = await reviewVideoClip(f.ctx, f.args);
@@ -105,6 +126,7 @@ it('retains only six candidates without changing their exact HTML or another ses
 
 it('keeps relative improvement separate from unmet goals, and refuses delivery after frame-level overflow', async () => {
   const f = await fixture();
+  f.ctx.finalReview = true;
   f.ctx.userRequest = '把文字放在透明弧面上';
   f.ctx.store.getProject = async () => ({ canvas: f.candidate.canvas, tracks: [{ segments: [{ id: 'clip', path: 'overlay', source: { start_us: 0 }, timeline: { start_us: 0, duration_us: 10_200_000 } }] }] });
   f.ctx.library.idForPath = x => x;
@@ -139,6 +161,7 @@ it('keeps relative improvement separate from unmet goals, and refuses delivery a
 
 it('uses the live goal for goal prompts, delivery, and cache identity', async () => {
   const f = await fixture();
+  f.ctx.finalReview = true;
   f.ctx.userRequest = '';
   let goal = '当前目标：文字贴合透明弧面';
   f.ctx.getGoal = () => goal;
@@ -164,4 +187,21 @@ it('rejects a comparison verdict or empty goal list instead of recording success
   expect(() => parseGoalReview(JSON.stringify(assessment))).toThrow('逐项');
   expect(() => parseGoalReview(JSON.stringify({ summary: '好了', criteria: [], remaining: [] }))).toThrow('逐项');
   expect(parseGoalReview(JSON.stringify({ summary: '待核实', remaining: ['未听音轨'], criteria: [{ requirement: '同步', status: 'uncertain', evidence: '视频无音轨' }] })).goal.status).toBe('uncertain');
+});
+
+it('sends only the changed window and rejects full-review requests before rendering in a normal turn', async () => {
+  const f = await fixture();
+  for (const args of [{ duration: 7 }, { mode: 'goal', duration: 2 }]) {
+    await expect(reviewVideoClip(f.ctx, { ...f.args, ...args })).rejects.toThrow('定稿验收');
+  }
+  expect(f.renders).toHaveLength(0);
+  const current = await f.ctx.candidates.add({ ...f.candidate, original: 'old', html: 'old', reference: null, reviews: [] });
+  f.ctx.vision.ask = async req => {
+    f.requests.push(req);
+    return JSON.stringify({ summary: '字幕可见', criteria: [{ requirement: '字幕', status: 'pass', evidence: '5秒处可见' }], remaining: [] });
+  };
+  const checked = await reviewVideoClip(f.ctx, { preview_id: current.id, start: 5, duration: 2 });
+  expect(checked.mode).toBe('segment');
+  expect(f.renders.map(({ start, duration }) => [start, duration])).toEqual([[5, 2]]);
+  expect(checked.assessment.ready_to_deliver).toBe(false);
 });

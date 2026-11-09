@@ -1,110 +1,188 @@
-import { createHash } from 'node:crypto';
+const readTools = new Set(['get_timeline', 'list_media', 'get_clip', 'read_page', 'read_shared_file',
+  'get_page_candidates', 'list_keyframes', 'list_markers', 'search_catalog', 'read_skill']);
+const reviewTools = new Set(['review_video_clip', 'review_video_frames', 'check_page_bounds', 'review_timeline']);
+const confirmation = '如需返工，请回复「确认修改」，也可在冒号后写明要改的项目。';
 
-const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
-const AUDIO_CRITERIA = new Set(['唱词准确性（独立听音核对）', '听感同步（实际亮词与声学时序）']);
-const unavailable = new Set(['video_unavailable', 'review_composition_unsupported', 'review_limit', 'review_incomplete']);
-const pending = '验收尚未通过，当前工程保留为待核实版本，不能作为全部达标的成片。';
+export function reviewIntent(text) {
+  if (/^(?:请)?(?:定稿验收|定稿|最终验收|完整对照)[。！!]?$/u.test(text.trim())) return 'final';
+  if (/^确认修改(?:[。！!]|[：:][\s\S]+)?$/u.test(text.trim())) return 'repair';
+  return 'edit';
+}
 
-// One controller per user turn: tools and automatic continuations share the same
-// review budget, actual project and audio cache. Feedback is never a user message.
-export function createReviewGate({ store, projectId, candidates, pages, reviewClips, budget, library }) {
-  let touched = false, latest = null, failure = null;
+// Only an incoming user turn can authorize repairs. A tool result or continuation cannot.
+export function createReviewGate({ session, intent, store, projectId, candidates, pages, reviewClips, library }) {
+  const final = intent === 'final';
+  const reviews = [];
+  const findings = new Map();
   const writtenMedia = new Set();
+  const previewedPages = new Set();
+  const changedClips = new Set();
+  let timelineEdited = false;
+  let stopped = '', reviewOnly = false, replicaReviewed = false, calibrated = false;
+  function hold(reason) {
+    session.pendingReview = true;
+    stopped = [reason, confirmation].join('\n');
+  }
   return {
-    observe(name, result) {
-      if (name === 'write_page' && result.ok !== false) { touched = true; writtenMedia.add(result.media_id); }
+    isStopped: () => Boolean(stopped),
+    markIncomplete() { session.pendingReview = true; },
+    allow(name, args) {
+      if (stopped) return stopped;
+      if (readTools.has(name)) return null;
+      const inspecting = reviewTools.has(name) || (name === 'preview_page' && args?.page_id && args.html === undefined && args.patches === undefined);
+      if (final || reviewOnly) return inspecting ? null : '当前只执行复核。' + confirmation;
+      if (session.pendingReview && intent !== 'repair') return '当前有待确认的验收问题。' + confirmation;
+      if (args?.page_id && previewedPages.has(args.page_id) && ['preview_page', 'write_page'].includes(name)
+        && (args.html !== undefined || args.patches !== undefined)) {
+        hold('本轮页面候选已预览。再次调整前请确认。');
+        return stopped;
+      }
+      if (name === 'refine_reference' && (intent !== 'repair' || calibrated)) return confirmation;
+      if ((replicaReviewed || calibrated) && !inspecting) return '本轮复核已结束。' + confirmation;
+      if (reviews.length && !inspecting) {
+        const last = reviews.at(-1);
+        if (name !== 'write_page' || !last.assessment.ready_to_adopt || !last.preview_id || args?.preview_id !== last.preview_id) {
+          return '本轮复核已结束。' + confirmation;
+        }
+      }
+      return null;
+    },
+    observe(name, result, args) {
+      if (name === 'preview_page' && result.preview_id && args?.page_id && (args.html !== undefined || args.patches !== undefined)) {
+        previewedPages.add(args.page_id);
+      }
+      if (name === 'review_timeline' && result.ok) reviewOnly = true;
+      if (!final && name === 'check_page_bounds' && result.boundaries && result.boundaries.status !== 'pass') {
+        const bounds = result.boundaries;
+        hold(`已检查 ${bounds.start}–${Number((bounds.start + bounds.duration).toFixed(3))} 秒的文字边界，`
+          + (bounds.status === 'fail' ? `${bounds.violating_frames} 帧存在裁字。` : '现有证据无法确认文字完整。'));
+      }
+      if (intent === 'repair' && result.ok && result.total_duration > 0 && !readTools.has(name) && !reviewTools.has(name)
+        && !['replicate_reference', 'refine_reference', 'create_track', 'rename_project'].includes(name)) {
+        timelineEdited = true;
+        for (const id of [args?.clip_id, result.clip_id, ...(result.clip_ids ?? [])]) if (id) changedClips.add(id);
+      }
+      if (name === 'refine_reference') calibrated = true;
+      if (name === 'replicate_reference' && result.ok && result.verification) {
+        replicaReviewed = true;
+        if (result.verification.final?.meanError > 0.12) hold(result.note || '首版与参考仍有差异。');
+      }
+      if (name === 'write_page' && result.ok !== false) writtenMedia.add(result.media_id);
       if (name !== 'review_video_clip') return;
+      // Inspecting source footage before the first edit isn't review of a candidate.
+      if (args?.media_id && !writtenMedia.has(args.media_id) && !library.get(args.media_id)?.source?.pageId) return;
       if (result.ok === false) {
-        if (unavailable.has(result.code)) failure = result.message;
+        if (['video_unavailable', 'vision_unavailable', 'review_composition_required', 'review_composition_unsupported', 'review_limit', 'review_incomplete'].includes(result.code)) hold(result.message);
         return;
       }
-      if (result.mode === 'goal') { touched = true; latest = result; failure = null; }
+      const a = result.assessment;
+      if (!a) return;
+      reviews.push(result);
+      const passed = result.mode === 'comparison' ? a.ready_to_adopt : a.goal?.status === 'pass';
+      if (!passed) {
+        const start = result.composition?.start ?? result.verification.start;
+        const issues = (a.goal?.criteria ?? []).filter(c => c.status !== 'pass').map(c => c.requirement + '：' + c.evidence);
+        const details = [...new Set([a.summary, ...issues, ...(a.regressions ?? []), ...(a.remaining ?? [])].filter(Boolean))];
+        const finding = `已复核 ${start}–${Number((start + result.verification.duration).toFixed(3))} 秒，${a.goal?.status === 'fail' || a.decision === 'regressed' ? '未通过' : '仍有待确认项'}。\n${details.join('\n')}`;
+        if (final) { findings.set(result, finding); session.pendingReview = true; }
+        else hold(finding);
+      }
     },
     async check() {
-      if (!touched) return null;
-      const stop = reason => ({ notice: `${pending}\n${reason}` });
-      if (failure) return stop(failure);
+      if (stopped) return { notice: stopped };
+      if (!final && !reviews.length && !writtenMedia.size && !timelineEdited) return null;
       const project = await store.getProject(projectId);
-      if (!latest && library && !(project.tracks ?? []).flatMap(t => t.segments ?? []).some(s => s.path && writtenMedia.has(library.idForPath(s.path)))) return null;
-      let candidate = null, liveHtml = null, scene = null;
-      if (latest?.preview_id) {
+      const tracks = (project.tracks ?? []).flatMap(t => t.segments ?? []);
+      if (!final && !reviews.length && !timelineEdited && !tracks.some(s => s.path && writtenMedia.has(library.idForPath(s.path)))) return null;
+      const end = Math.max(0, ...tracks.map(s => (s.timeline.start_us + s.timeline.duration_us) / 1e6));
+      const windows = [], currentFindings = [], reviewedMedia = new Set();
+      for (const r of reviews) {
+        if ((!r.preview_id && !r.timeline) || !r.composition) continue;
+        if (final && r.mode !== 'goal') continue;
         try {
-          candidate = await candidates.get(latest.preview_id);
-          liveHtml = await pages.read(candidate.pageId);
-          scene = await reviewClips.composition({ project, pageId: candidate.pageId, html: candidate.html,
-            clipId: latest.composition?.clipId, start: latest.verification?.start ?? 0, duration: latest.verification?.duration });
-        } catch { /* A removed page or changed timeline needs a fresh preview. */ }
+          const c = r.timeline ? null : await candidates.get(r.preview_id);
+          if (c && await pages.read(c.pageId) !== c.html) continue;
+          const scene = await reviewClips.composition({ project, pageId: c?.pageId, html: c?.html, timeline: r.timeline, clipId: r.composition.clipId,
+            start: r.verification.start, duration: r.verification.duration });
+          if (scene?.key === r.composition.key) {
+            windows.push([scene.start, scene.start + r.verification.duration]);
+            if (writtenMedia.size) {
+              const clip = tracks.find(s => s.id === r.composition.clipId);
+              if (clip?.path) reviewedMedia.add(library.idForPath(clip.path));
+            }
+            if (findings.has(r)) currentFindings.push(findings.get(r));
+          }
+        } catch { /* An obsolete candidate cannot certify the current timeline. */ }
       }
-      const fingerprint = hash({ canvas: project.canvas, tracks: project.tracks, html: liveHtml,
-        candidate: candidate?.html, scene: scene?.key,
-        review: latest && [latest.composition?.key, latest.verification?.start, latest.verification?.duration] });
-      const more = prompt => {
-        if (budget.calls >= 4 || budget.noImprovement >= 2) return stop('已达到本轮复核上限；保留当前版本及候选，不继续重听或重复评审。');
-        return { fingerprint, prompt };
-      };
-      if (!latest || !candidate || !scene || scene.key !== latest.composition?.key
-          || (liveHtml !== candidate.html && liveHtml !== candidate.original)) {
-        return more('当前工程缺少有效的完整目标验收，或页面/时间线在验收后发生变化。读取当前工程，preview_page，再用 review_video_clip(mode="goal") 检查真实完整合成；不能拿旧候选的通过结论收尾。8–12秒以内检查全程，较长作品逐段检查并准确报告覆盖范围。');
-      }
-      const assessment = latest.assessment;
-      if (assessment.ready_to_deliver === true) {
-        if (liveHtml !== candidate.html) return more(`候选 ${latest.preview_id} 已通过，但尚未保存到时间线。用 write_page(preview_id="${latest.preview_id}") 采纳同一候选，再确认当前合成；不能交付旧页面。`);
-        return null;
-      }
-      const visual = (assessment.goal?.criteria ?? []).filter(c => !AUDIO_CRITERIA.has(c.requirement) && c.status !== 'pass');
-      const audible = latest.audible;
-      const words = audible?.lyric_accuracy?.confirmed_differences ?? [];
-      const timing = audible?.synchronization?.late_or_early ?? [];
-      const missing = audible?.synchronization?.missing_highlights ?? [];
-      const end = Math.max(0, ...(project.tracks ?? []).flatMap(t => t.segments ?? []).map(s => (s.timeline.start_us + s.timeline.duration_us) / 1e6));
-      const full = latest.composition?.start <= 1e-6
-        && latest.composition.start + (latest.verification?.duration ?? 0) >= end - 1e-6;
-      if (assessment.goal?.status === 'pass' && !full) {
-        const reviewStart = Number.isFinite(latest.composition?.start) ? latest.composition.start : (latest.verification?.start ?? 0);
-        const reviewDuration = Number.isFinite(latest.verification?.duration) ? latest.verification.duration : 0;
-        return stop(`本次区间目标已通过，但只覆盖 ${reviewStart.toFixed(3)}–${(reviewStart + reviewDuration).toFixed(3)} 秒，未覆盖完整 ${end.toFixed(3)} 秒时间线；完整成片仍未验收，ready_to_deliver 保持 false。长作品请继续分段复核并如实报告覆盖范围。`);
-      }
-      if (!visual.length && !words.length && !timing.length && !missing.length && full && audible) {
-        if (liveHtml !== candidate.html) {
-          const improved = candidate.reviews?.some(r => r.decision === 'improved' && r.ready_to_adopt && !r.regressions?.length);
-          return more(improved
-            ? `候选 ${latest.preview_id} 的可测画面已通过，真实对照也确认改善，但尚未保存。先 write_page(preview_id="${latest.preview_id}") 采纳并核对当前合成；音频分歧保留待核实，不再次盲听。`
-            : `候选 ${latest.preview_id} 的可测画面已通过，但尚未确认比正式页改善。用真实合成对照确认改善且无回退后保存同一候选；音频分歧不能通过重复盲听消除，也不能让已修复画面只留在未采纳候选里。`);
+      const missing = tracks.filter(s => s.path && writtenMedia.has(library.idForPath(s.path)) && !reviewedMedia.has(library.idForPath(s.path))
+        && !windows.some(([a,b]) => s.timeline.start_us / 1e6 < b && (s.timeline.start_us + s.timeline.duration_us) / 1e6 > a));
+      if (!final && reviews.length && !missing.length) {
+        if (intent === 'repair' && windows.length) delete session.pendingReview;
+        if (!windows.length) {
+          hold('已复核候选，当前时间线尚无对应的有效复核结果。');
+          return { notice: stopped };
         }
-        return stop(`可测画面项目已通过，但音频仍有证据不足：${audible.lyric_accuracy?.uncertain_words?.length ?? 0} 处唱词分歧、${audible.synchronization?.uncertain_timings?.length ?? 0} 个不确定时间点。保留原始测量，不猜词、不凭低置信度挪动时序，也不重复听同一音轨博取通过。`);
+        const ranges = windows.map(([from,to]) => `${from}–${Number(to.toFixed(3))} 秒`).join('、');
+        return { notice: `本轮局部复核通过（${ranges}）。${reviews.at(-1).assessment.summary}\n定稿时可发起「定稿验收」。` };
       }
-      return more(`当前目标验收未通过，不能只报告问题就结束。请在同一工程内依据以下证据修正，再预览、复核并保存有效候选；只处理用户要求内的问题，保留正常部分。\n${JSON.stringify({ preview_id: latest.preview_id, unmet_visual: visual, remaining: assessment.remaining, confirmed_lyric_differences: words, reliable_timing_errors: timing, missing_highlights: missing, full_timeline_covered: full })}\n音频中未确认的唱词或低置信度时间不属于确定可修正项，复用已有音频诊断，不重听同一素材抽取另一个答案。只有比较结果有实际改善且无回退才采纳修改；剩余不确定性单独报告。`);
+      if (final && !end) return { notice: '时间线为空，尚无成片可验收。' };
+      let covered = 0;
+      for (const [from, to] of windows.sort((a, b) => a[0] - b[0])) {
+        if (from > covered + 1e-6) break;
+        covered = Math.max(covered, to);
+      }
+      if (final && covered >= end - 1e-6) {
+        if (currentFindings.length) return { notice: [`已检查完整时间线 0–${end} 秒。`, ...currentFindings, confirmation].join('\n') };
+        delete session.pendingReview;
+        return { notice: `已完成定稿验收，当前时间线 0–${end} 秒的目标检查均已通过。` };
+      }
+      reviewOnly = true;
+      const touched = tracks.filter(s => changedClips.has(s.id)).map(s =>
+        `${s.id}（${s.timeline.start_us / 1e6}–${(s.timeline.start_us + s.timeline.duration_us) / 1e6} 秒）`);
+      return final
+        ? { prompt: `继续只读定稿验收。从时间线 ${Math.min(covered, Math.max(0, end - 0.5))} 秒起，用 review_video_clip(timeline=true,mode=goal,start,duration) 检查至 ${end} 秒，每段最多12秒，按参考区间拆分，覆盖剩余全片。`,
+          notice: [`定稿验收未完成。从片头连续验收到 ${covered} 秒，全片 ${end} 秒。`, ...currentFindings, ...(currentFindings.length ? [confirmation] : [])].join('\n') }
+        : { prompt: `请按本轮实际改动选取对应的时间，使用 review_video_clip(timeline=true,mode=segment,start,duration) 复核改动前后 2–4 秒，然后报告。涉及片段：${[...touched, ...missing.map(s => s.id)].join('、')}。不要修改工程。`,
+          notice: '当前版本已保留，改动区间尚未完成复核。' };
     },
   };
 }
 
-// Both API and CLI runtimes can finish prematurely. Continue in the same turn,
-// with a cumulative tool limit and a bounded number of distinct repair attempts.
-export async function runReviewedConversation({ converse, reviewGate, onContinue = () => {}, ...options }) {
-  let calls = 0, continuation = '', attempts = 0;
-  const seen = new Set();
-  const stop = (result, reason) => {
-    const text = reason.startsWith(pending) ? reason : `${pending}\n${reason}`;
-    options.history.push({ role: 'assistant', content: text });
-    options.onText?.(text);
-    return { ...result, text, toolCalls: calls };
+export async function runReviewedConversation({ converse, reviewGate, execute, ...options }) {
+  // CLI tool calls can overlap. A queued edit must see the preceding review verdict.
+  let queue = Promise.resolve();
+  const run = call => {
+    const done = queue.then(async () => {
+      options.signal?.throwIfAborted();
+      let args = call.arguments;
+      if (typeof args === 'string') { try { args = JSON.parse(args); } catch { args = null; } }
+      const blocked = reviewGate.allow(call.name, args);
+      if (blocked) return { ok: false, code: 'review_confirmation_required', message: blocked };
+      const output = await execute(call);
+      reviewGate.observe(call.name, output, args);
+      return output;
+    });
+    queue = done.catch(() => {});
+    return done;
   };
+  let calls = 0, continuation = '';
+  const seen = new Set();
   for (;;) {
     options.signal?.throwIfAborted();
-    const result = await converse({ ...options, maxToolCalls: options.maxToolCalls - calls, continuation,
-      context: async () => [await options.context?.(), continuation && `【应用自主验收反馈，不是用户追加消息】\n${continuation}`].filter(Boolean).join('\n\n') });
-    calls += result.toolCalls;
+    const result = await converse({ ...options, execute: run, stopAfterTools: reviewGate.isStopped, maxToolCalls: options.maxToolCalls - calls, continuation,
+      context: async () => [await options.context?.(), continuation].filter(Boolean).join('\n\n') });
+    await queue;
     options.signal?.throwIfAborted();
+    calls += result.toolCalls;
     const next = await reviewGate.check();
     if (!next) return { ...result, toolCalls: calls };
-    if (next.notice) return stop(result, next.notice);
-    if (calls >= options.maxToolCalls) return stop(result, '工具调用预算已用完，仍有目标未完成或未复核。');
-    if (attempts >= 3) return stop(result, '自动修正已到本轮上限，仍有目标未通过。');
-    if (seen.has(next.fingerprint)) return stop(result, '自动续跑后没有新的有效修改或验收证据，已停止重复尝试。');
-    seen.add(next.fingerprint);
+    if (!next.prompt || seen.has(next.prompt) || calls >= options.maxToolCalls) {
+      if (next.prompt) reviewGate.markIncomplete();
+      options.history.push({ role: 'assistant', content: next.notice });
+      options.onText?.(next.notice);
+      return { ...result, text: next.notice, toolCalls: calls };
+    }
     continuation = next.prompt;
-    attempts++;
-    options.onText?.('验收未通过，正在依据证据继续修正…');
-    await onContinue(attempts);
+    seen.add(continuation);
   }
 }

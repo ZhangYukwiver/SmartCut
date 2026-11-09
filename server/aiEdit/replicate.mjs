@@ -202,6 +202,12 @@ export async function generateReplicaPlan(ctx, { item, look, canvas, url, instru
   const initialEvidence = evidence;
   const metrics = value => ({ frameCount: value.frameCount ?? value.samples.length, meanError: value.meanError,
     localError: value.localError, temporalError: value.temporalError, worstError: value.worstError });
+  if (ctx.firstPassOnly) {
+    await ctx.onReplicaStage?.('initial', best);
+    return { ...best, initialError, initialEvidence, inputMode, measured: 0, vision: vision.snapshot(),
+      verification: { initial: metrics(evidence), final: metrics(evidence), candidates: [],
+        comparison: frameReviewDiagnostics(evidence, evidence), quality: '待人工确认', flowCompleted: true } };
+  }
   const candidates = [];
   let feedback = [], rejectedSheets = [];
   const context = { item, look, canvas, library: ctx.library };
@@ -357,7 +363,8 @@ export async function replicateReference(ctx, args) {
     }
     const duration = Math.min(item.durationUs / 1e6, look.duration, audioId ? ctx.library.get(audioId).durationUs / 1e6 : Infinity);
     const note = [plan.summary, `已生成 ${plan.layers.length} 个独立可编辑图层${audioId ? '及独立原声音轨' : ''}；起点 ${origin} 秒。`,
-      `已使用${inputMode}识别，并将实际渲染与原片对照修正。平均像素差异 ${initialError.toFixed(3)} → ${evidence.meanError.toFixed(3)}（越小越好，不是复刻准确率）。`,
+      ctx.firstPassOnly ? `已复核首版。平均像素差异 ${evidence.meanError.toFixed(3)}，如需校准请确认修改。`
+        : `已使用${inputMode}识别，并将实际渲染与原片对照修正。平均像素差异 ${initialError.toFixed(3)} → ${evidence.meanError.toFixed(3)}（越小越好，不是复刻准确率）。`,
       measured ? `其中 ${measured} 个编号色块图层已根据原片测量轮廓、颜色和时间；工程保存可编辑参数，没有嵌入原片帧。` : '',
       evidence.meanError > .12 ? '画面对照仍有明显偏差，此结果是待校准草稿，不能声称高还原。' : `已逐帧对照 ${evidence.frameCount ?? evidence.samples.length} 帧；流程完成不代表效果已经达标，细节仍需观看成片确认。`,
       visionFor(ctx).note(),

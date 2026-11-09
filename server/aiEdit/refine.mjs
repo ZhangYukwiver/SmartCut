@@ -195,7 +195,7 @@ function measuredRefinement(project, target, evidence, tried) {
 
 export async function refineReference(ctx, args = {}) {
   if (!ctx.askLook) throw new AiEditError('look_unavailable', LOOK_UNAVAILABLE, 409);
-  const rounds = args.max_rounds ?? DEFAULT_REFINE_ROUNDS;
+  const rounds = ctx.firstPassOnly ? 1 : args.max_rounds ?? DEFAULT_REFINE_ROUNDS;
   const vision = visionFor(ctx);
   if (!Number.isInteger(rounds) || rounds < 1 || rounds > 12) fail('自动校准轮数应为 1–12');
   let project = await ctx.store.getProject(ctx.projectId);

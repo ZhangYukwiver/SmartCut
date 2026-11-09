@@ -439,6 +439,7 @@ export interface AiEditChatItem {
 }
 
 export interface AiEditSession extends AiEditSessionSummary {
+  pendingReview?: boolean;
   /** 用户给这条片子定的目标：每次请求都写进系统提示，对话再长被裁掉也还在；空字符串表示没定 */
   goal?: string;
   revision: number;

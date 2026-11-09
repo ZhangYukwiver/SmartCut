@@ -43,6 +43,7 @@ export function sessionDetail(session) {
   const checkpoints = session.checkpoints ?? [];
   return {
     ...sessionSummary(session),
+    ...(session.pendingReview ? { pendingReview: true } : {}),
     goal: session.goal,
     // 历史太长、更早的对话 AI 已经记不全了
     trimmed: Boolean(session.trimmed),

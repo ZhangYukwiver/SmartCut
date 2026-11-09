@@ -272,6 +272,9 @@ describe("AI edit help from the open page", () => {
           return textReply('叠加预览画面可见。');
         }
         reviews++;
+        if (parts.some(p => p.text?.includes('只判断本段可检查的要求'))) {
+          return textReply(JSON.stringify({ summary: '叠加可见', criteria: [{ requirement: '画面', status: 'pass', evidence: '该时段可见叠加' }], remaining: [] }));
+        }
         return textReply(JSON.stringify({ decision: 'unchanged', summary: 'reviewed', evidence: ['continuous frames'], regressions: [], remaining: [], ready_to_adopt: false }));
       }
       const result = phase ? lastToolResult(body) : null;

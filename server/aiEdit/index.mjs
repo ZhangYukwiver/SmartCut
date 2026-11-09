@@ -15,7 +15,7 @@ import { createFilmStudio } from "./film/studio.mjs";
 import { FACTS_FILE, patchPageHtml, sharedAssetBytes, sharedFolderOf } from "./film/pages.mjs";
 import { pageCandidates } from './pageCandidates.mjs';
 import { requireCurrentVideoReview } from './videoReview.mjs';
-import { createReviewGate, runReviewedConversation } from './reviewTurn.mjs';
+import { createReviewGate, reviewIntent, runReviewedConversation } from './reviewTurn.mjs';
 import { backgroundNote, parseGenerateConfig } from "./generate.mjs";
 import { AiEditError, MediaLibrary, isMediaId, publicItem } from "./library.mjs";
 import { displayName, withPreviewHints } from "./catalog.mjs";
@@ -819,7 +819,7 @@ export function createAiEdit({
     const reviewBudget = { calls: 0, noImprovement: 0 };
     const candidates = pageCandidates(root, session.id);
     const pages = pageTools(session, signal, Boolean(turn.pageRefine));
-    const reviewGate = createReviewGate({ store, projectId: session.projectId, candidates, pages, reviewClips: state.film.reviewClips, budget: reviewBudget, library });
+    const reviewGate = createReviewGate({ session, intent: turn.reviewIntent, store, projectId: session.projectId, candidates, pages, reviewClips: state.film.reviewClips, library });
     const runTool = createToolRunner({
       store, library, projectId: session.projectId, signal,
       cutout: state.cutout,
@@ -870,6 +870,8 @@ export function createAiEdit({
       },
       sessionId: session.id,
       reviewBudget,
+      finalReview: turn.reviewIntent === 'final',
+      firstPassOnly: true,
       userRequest: session.history.filter(m => m.role === 'user').map(m => m.content).filter(s => typeof s === 'string').join('\n').slice(0, 12000),
       getGoal: () => session.goal,
       // arrange_grid 排过的格子记在会话上（跟着会话存盘），换画布时按新画布重排
@@ -881,7 +883,7 @@ export function createAiEdit({
     let stopped = false;
     try {
       if (turn.refine) {
-        const { result, action } = await runTool('refine_reference', {});
+        const { result, action } = await runTool('refine_reference', { max_rounds: 1 });
         streaming.actions.push(action);
         await sessions.touch(session);
         if (!result.ok) throw new AiEditError(result.code, result.message, 422);
@@ -891,10 +893,6 @@ export function createAiEdit({
       const converse = isLocalRuntime(config.runtime) ? runCliConversation : runConversation;
       const result = await runReviewedConversation({
         converse, reviewGate,
-        onContinue: async attempt => {
-          streaming.actions.push({ name: 'continue_review', summary: `验收未通过，自动继续修正（${attempt}/3）`, ok: true });
-          await sessions.touch(session);
-        },
         // 生成工具只在配了 Key 时才给、技能工具只在有启用的技能时才给（本机 CLI 的 MCP 工具清单也走这里）
         config, history: session.history, tools: toolsFor({ generation: turn.generation, skills: turn.skills }), signal, fetchImpl, onText, maxToolCalls: MAX_TOOL_CALLS,
         localAi, goal: () => session.goal,
@@ -911,11 +909,14 @@ export function createAiEdit({
           project: await store.getProject(session.projectId), media: library.list(), goal: session.goal, freeOnly: turn.freeOnly,
           facts: await state.film.pages.readShared(sharedFolderOf(session.projectId), FACTS_FILE).catch(() => ""),
           generation: { image: Boolean(turn.generation?.image), video: turn.generation?.video ? turn.generation.video.provider ?? "seedance" : false }, skills: turn.skills,
-        }) + (turn.pageRefine ? '\n本轮用户点击自动校准，当前工程含网页动画。先读取当前时间线、页面和已有候选，依据用户纠正与实际连续画面判断合成结构，再做最小修改；不要把底层连续播放加上层遮罩揭开误建成每窗独立视频或移动贴图。已有结构判断和有效评审优先复用。preview_page只查构图和脚本异常，review_video_clip(preview_id,start,duration)在当前时间线连同底层一起渲染问题前后2–4秒复核运动，有改善且无回退后write_page(preview_id)。候选不必等静帧完全一致才检查视频。参考关系已保存，不重复解析整条参考；没有新证据不反复请求或盲调同组参数。最多4次视频复核，连续两份无改善就停止并报告差异。不确定时只补能区分结构假设的短区间；缺少干净底片就明确缺失，不用含效果的成片假冒原始底片。采纳前复查原来正常的关键时刻与转场，判断仅覆盖实际输入区间。视频服务不可用时明确运动未验证，不用截图代替。不反复导出全片，不调用只支持drawing的refine_reference，不另造时间线。缺少唯一参考时才问一个关键问题。' : ''),
-        context: async () => buildContextMessage({ project: await store.getProject(session.projectId), library }),
+        }) + (turn.pageRefine ? '\n本轮用户确认校准一版，当前工程含网页动画。先读取当前时间线、页面和已有候选，依据用户纠正与实际连续画面判断合成结构，再做最小修改；不要把底层连续播放加上层遮罩揭开误建成每窗独立视频或移动贴图。已有结构判断和有效评审优先复用。preview_page只查构图和脚本异常，review_video_clip(preview_id,start,duration)在当前时间线连同底层一起渲染问题前后2–4秒复核运动，有改善且无回退后write_page(preview_id)。候选不必等静帧完全一致才检查视频。参考关系已保存，不重复解析整条参考；没有新证据不反复请求或盲调同组参数。复核发现问题即报告并等用户再次确认；不再按评审意见制作下一版；缺少干净底片就明确缺失，不用含效果的成片假冒原始底片。采纳前复查原来正常的关键时刻与转场，判断仅覆盖实际输入区间。视频服务不可用时明确运动未验证，不用截图代替。不反复导出全片，不调用只支持drawing的refine_reference，不另造时间线。缺少唯一参考时才问一个关键问题。' : ''),
+        context: async () => [buildContextMessage({ project: await store.getProject(session.projectId), library }),
+          turn.reviewIntent === 'final' ? '用户已发起定稿验收。只读当前正式版，从片头至片尾逐段复核，参考片按相同时段对照。'
+            : turn.reviewIntent === 'repair' ? '用户已确认本轮修改。只改本次指定的问题，再复核相应的短片。'
+            : session.pendingReview ? '上次验收仍有待确认项。可以解释结果，用户回复「确认修改」后再返工。' : ''
+        ].filter(Boolean).join('\n'),
         execute: async (call) => {
           const { result: output, action } = await runTool(call.name, call.arguments);
-          reviewGate.observe(call.name, output);
           streaming.actions.push(action);
           await sessions.touch(session);
           return output;
@@ -988,7 +989,8 @@ export function createAiEdit({
       return id && state.library.get(id)?.source?.type === 'page';
     })));
     if (!refine || pageRefine) try { skills = await state.skills.enabled(); } catch (error) { console.error("AI 剪辑读技能登记表失败:", error); }
-    const turn = { freeOnly, generation, skills, analysis, analysisIssue, refine: refine && !pageRefine, pageRefine };
+    const turn = { freeOnly, generation, skills, analysis, analysisIssue, refine: refine && !pageRefine, pageRefine,
+      reviewIntent: refine ? 'repair' : reviewIntent(text) };
     try {
       // 每轮开跑前存一份，可以撤销这一轮或者退回到这句话之前
       const { checkpoint, revision } = await saveCheckpoint(session, "turn", `AI 处理“${leading(text, 12)}”之前`);
