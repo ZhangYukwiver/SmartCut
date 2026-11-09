@@ -30,7 +30,7 @@ export function createReviewClips({ root, library, files, provider, getOrigin })
     signal?.throwIfAborted();
     if (!provider) throw new AiEditError('film_unavailable', '没有可用的本地渲染浏览器。', 503);
     if (mediaFile && (!mediaFile.startsWith(path.join(root, 'media') + path.sep) || html !== undefined)) throw new AiEditError('arguments_invalid', '复核素材来源无效。', 422);
-    const scene = project ? await composition({ project, pageId, html, clipId, start, duration }) : null;
+    const scene = project ? await composition({ project, pageId, html, clipId, start, duration, timeline: !pageId && html === undefined }) : null;
     if (project && !scene) throw new AiEditError('review_composition_required', '候选没有对应的时间线合成。', 422);
     const assets = mediaFile ? [await assetStamp(mediaFile)] : await pageAssetStamps(root, pageId, html);
     const key = reviewHash({ version: 7, html, pageId, mediaFile, assets, composition: scene?.key, width, height, start, duration, crop, fps, times, audit, audio });

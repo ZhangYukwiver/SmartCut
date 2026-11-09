@@ -76,13 +76,13 @@ function rememberSession(id: string | null) {
 }
 
 const SUGGESTIONS = [
-  "把参考视频做成同款，自动对照画面校准效果",
+  "把参考视频做成同款，先做一版并复核关键片段",
   "把素材库里的视频剪成 30 秒的竖屏短片，配上字幕",
   "按音乐节拍把这几段素材卡点剪在一起",
   "每段之间加转场，开头淡入、结尾淡出",
 ];
-const REPLICA_REQUEST = "把引用的参考视频做成同款，保留画面构图、文字、特效与节奏，原声单独成轨。按效果选择可编辑图层或可修改的网页动画；复杂空间和摄影机运动不要强行拆成二维图层。自动选择原始取景、清理需要去除的字幕，先做真实关键帧预览，对照参考自行校准，再生成完整动画并复查过渡。如实说明剩余差异，不把原片已完成特效段当成重建。";
-const REFINE_REQUEST = "自动对照原片校准当前已有工程，自行发现差距并多轮修正。保留已替换的素材和原声音轨，只保存经过渲染对照确有改善的版本；连续没有改善就停止，并告诉我停止原因和剩余差异。";
+const REPLICA_REQUEST = "把引用的参考视频做成同款，保留画面构图、文字、特效与节奏，原声单独成轨。按效果选择可编辑图层或可修改的网页动画。选择原始取景、清理需要去除的字幕，生成第一版，复核关键片段并报告差异。等我确认后再修改。";
+const REFINE_REQUEST = "确认修改：按已有复核结果校准一版，检查改动区间并报告。";
 
 function AiEditWorkspaceImpl({ connection, onReconnect }: Props) {
   const baseUrl = connection?.baseUrl ?? null;
@@ -159,6 +159,8 @@ function AiEditWorkspaceImpl({ connection, onReconnect }: Props) {
   const mediaById = useMemo(() => new Map(media.map((item) => [item.id, item])), [media]);
   const hasPageClips = project?.tracks.some(track => track.segments.some(segment =>
     'path' in segment && mediaById.get(mediaIdFromPath(segment.path) ?? '')?.source.type === 'page')) ?? false;
+  const hasTimeline = project?.tracks.some(track => track.segments.length > 0);
+  const canCalibrate = hasPageClips || project?.tracks.some(track => track.segments.some(segment => 'drawing' in segment && segment.drawing?.referenceId));
   // AI 停下来等用户点头：花钱生成视频，或者运行技能里的命令
   const waitingFor = session?.streaming?.spend ? "等你确认要不要生成视频" : session?.streaming?.command ? "等你确认要不要运行技能命令" : null;
   // 能在看板上手动改：有工程、AI 没在剪、没在导入、上一个手动改动已经回来；AI 停下来等确认时直说在等用户
@@ -387,11 +389,11 @@ function AiEditWorkspaceImpl({ connection, onReconnect }: Props) {
     }
   };
 
-  const send = async (raw = input, reference?: AiEditMediaItem, calibrate = false) => {
+  const send = async (raw = input, reference?: AiEditMediaItem, calibrate = false, reviewAction = false) => {
     const text = raw.trim();
     if (!conn || !text || running || editLock.current || uploading) return;
     // 发的是此刻看得到的引用和附图；发出去之后才加的留着
-    const outgoing = reference || calibrate ? null : shownDraft;
+    const outgoing = reference || calibrate || reviewAction ? null : shownDraft;
     if (!aiConfigReady(config)) {
       setSettings("model");
       setError("先在 AI 设置里填好 Key 和模型。");
@@ -410,7 +412,7 @@ function AiEditWorkspaceImpl({ connection, onReconnect }: Props) {
       }
       const target = currentId && !reference ? { id: currentId, project } : await createSession().then((created) => created && { id: created.session.id, project: created.project });
       if (!target) return;
-      const framed = !calibrate && region && target.id === currentId ? region : null;
+      const framed = !calibrate && !reviewAction && region && target.id === currentId ? region : null;
       const refs: ComposerRef[] = reference ? [{ kind: 'media', mediaId: reference.id }] : outgoing?.refs ?? [];
       const files = outgoing?.files ?? [];
       // 「解析视频」和借方舟 Key 都要读解析库那份配置：可能刚在别的页面改过，每次发的时候现读
@@ -426,7 +428,7 @@ function AiEditWorkspaceImpl({ connection, onReconnect }: Props) {
         generation: generationForRequest(generate, config, analysis),
         analysis: aiConfigReady(analysis) ? analysis : null,
       });
-      if (!reference && !calibrate) setInput("");
+      if (!reference && !calibrate && !reviewAction) setInput("");
       setLeftTab('chat');
       if (framed) setRegionDraft((current) => (current?.sessionId === target.id ? null : current));
       // 这一排全部清掉（没发的片尾之后的时刻也清）；还没有剪辑时发的，这一排已经交给了新建的剪辑
@@ -747,9 +749,10 @@ function AiEditWorkspaceImpl({ connection, onReconnect }: Props) {
           />
         : <>
           <GoalBar sessionId={currentId} goal={session?.goal ?? ""} onSave={saveGoal} />
-          {hasPageClips || project?.tracks.some(track => track.segments.some(segment => 'drawing' in segment && segment.drawing?.referenceId)) ? <View style={styles.noticeBar}>
-            <Text style={styles.noticeText}>{hasPageClips ? '先判断合成结构，局部修改后连同底层复核短片；有改善才采纳，并记录用量。' : '逐帧找差异，检查快速转场和短闪，修正后复核，可撤销。'}</Text>
-            <SmallButton label="自动校准" disabled={running || sending || uploading || editBusy || building} onPress={() => void send(REFINE_REQUEST, undefined, true)} />
+          {session?.pendingReview || hasTimeline ? <View style={styles.noticeBar}>
+            <Text style={styles.noticeText}>{session?.pendingReview ? '复核发现待处理项，是否修改由你决定。' : '修改后先复核改动片段。'}</Text>
+            {(session?.pendingReview || canCalibrate) && <SmallButton label={session?.pendingReview ? "确认修改" : "校准一版"} disabled={running || sending || uploading || editBusy || building} onPress={() => session?.pendingReview ? void send("确认修改", undefined, false, true) : void send(REFINE_REQUEST, undefined, true)} />}
+            {hasTimeline && <SmallButton label="定稿验收" disabled={running || sending || uploading || editBusy || building} onPress={() => void send("定稿验收", undefined, false, true)} />}
           </View> : null}
           <View style={styles.middle}>
             <Conversation session={session} loaded={sessionsLoaded} running={running} editable={editable} mediaUrl={mediaUrl} inline={replyInline} streamText={streamText}

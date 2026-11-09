@@ -31,20 +31,22 @@ export async function pageAssetStamps(root, pageId, html) {
 }
 
 // 与正式导出共用合成器，仅替换目标页的临时引用；时间线及原始页不改写。
-export async function reviewComposition({ root, library, project, pageId, html, clipId, start, duration }) {
-  if (!pageId) return null;
+export async function reviewComposition({ root, library, project, pageId, html, clipId, start, duration, timeline = false }) {
+  if (!pageId && !timeline) return null;
   const mediaOf = file => library.get(library.idForPath(file));
-  const matches = (project.tracks ?? []).flatMap(t => t.segments ?? []).filter(s => s.path && mediaOf(s.path)?.source?.pageId === pageId);
-  if (!matches.length) {
+  const segments = (project.tracks ?? []).flatMap(t => t.segments ?? []);
+  const matches = pageId ? segments.filter(s => s.path && mediaOf(s.path)?.source?.pageId === pageId) : [];
+  if (!timeline && !matches.length) {
     if (clipId) fail('指定片段没有使用这份候选页面。');
     return null;
   }
   const target = clipId ? matches.find(s => s.id === clipId) : matches.length === 1 ? matches[0] : null;
-  if (!target) fail('同一页面在时间线出现多次，请提供 clip_id，明确复核哪一处合成。');
+  if (!timeline && !target) fail('同一页面在时间线出现多次，请提供 clip_id，明确复核哪一处合成。');
   // film.html 使用毫秒时钟；网页片段在当前原生合成器中不变速。
   const ms = us => Math.round(us / 1000) / 1000;
-  const at = ms(target.timeline.start_us), from = ms(target.source?.start_us ?? 0);
-  const end = ms(target.timeline.start_us + target.timeline.duration_us);
+  const at = ms(target?.timeline.start_us ?? 0), from = ms(target?.source?.start_us ?? 0);
+  const end = target ? ms(target.timeline.start_us + target.timeline.duration_us)
+    : Math.max(0, ...segments.map(s => (s.timeline.start_us + s.timeline.duration_us) / 1e6));
   const timelineStart = at + start - from;
   if (timelineStart < at - 1e-6 || timelineStart + duration > end + 1e-6) fail('页面复核区间不在指定时间线片段内，请缩短区间或选择对应 clip_id。');
   const active = { ...project, tracks: project.tracks.map(t => ({ ...t, segments: (t.segments ?? []).filter(s =>
@@ -74,6 +76,6 @@ export async function reviewComposition({ root, library, project, pageId, html, 
     assets.push(...await pageAssetStamps(root, path.posix.dirname(rel), html));
   }
   const candidateAssets = html === undefined ? [] : await pageAssetStamps(root, pageId, html);
-  const key = createHash('sha256').update(JSON.stringify({ version: 1, plan, assets, html, candidateAssets, clipId: target.id, timelineStart, duration })).digest('hex');
-  return { ...plan, key, clipId: target.id, start: timelineStart };
+  const key = createHash('sha256').update(JSON.stringify({ version: 1, plan, assets, html, candidateAssets, clipId: target?.id, timelineStart, duration })).digest('hex');
+  return { ...plan, key, clipId: target?.id, start: timelineStart };
 }

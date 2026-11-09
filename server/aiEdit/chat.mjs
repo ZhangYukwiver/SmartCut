@@ -417,7 +417,7 @@ function complete(call) {
  */
 export async function runConversation({
   config, history, tools, system, context, execute, signal, fetchImpl = modelFetch, onText = () => undefined, maxToolCalls = MAX_TOOL_CALLS,
-  readAttachment = async () => null, onAction = () => undefined, onTrimmed = () => undefined,
+  readAttachment = async () => null, onAction = () => undefined, onTrimmed = () => undefined, stopAfterTools,
 }) {
   let calls = 0;
   let limited = false;
@@ -537,6 +537,7 @@ export async function runConversation({
       }
       history.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(result) });
     }
+    if (stopAfterTools?.()) return { text: joined(), toolCalls: calls };
     if (calls >= maxToolCalls) limited = true;
   }
 }

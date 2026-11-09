@@ -78,6 +78,10 @@ it('composites the unchanged base video with a temporary overlay at the timeline
   const changed = await clips.render(args);
   expect(changed.cached).toBe(false); expect(changed.composition.key).not.toBe(first.composition.key);
   expect(films).toHaveLength(2);
+  const formal = await clips.composition({ project, timeline: true, start: 5.2, duration: 1 });
+  expect(formal.start).toBe(5.2);
+  expect(formal.html).toContain('/index.html');
+  expect(formal.html).not.toContain('_review-candidate');
   expect(await readFile(path.join(pageDir, 'index.html'), 'utf8')).toBe('original mask');
   expect(await readdir(pageDir)).toEqual(['index.html']); expect(JSON.stringify(project)).toBe(before);
   project.tracks[1].segments.push({ ...project.tracks[1].segments[0], id: 'other-mask' });

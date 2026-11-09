@@ -95,7 +95,7 @@ export function renderTranscript(entries, maxChars = TRANSCRIPT_CHARS, onTrimmed
  */
 export async function runCliConversation({
   config, history, tools, system, context, execute, signal, onText = () => undefined, maxToolCalls = MAX_TOOL_CALLS, localAi, goal = () => "",
-  onAction = () => undefined, onTrimmed = () => undefined, continuation = '',
+  onAction = () => undefined, onTrimmed = () => undefined, continuation = '', stopAfterTools,
 }) {
   const label = LOCAL_RUNTIMES[config.runtime].label;
   if (!localAi) throw new AiEditError("local_runtime_unavailable", "本机 AI 没准备好，请重启应用。", 503);
@@ -138,6 +138,7 @@ export async function runCliConversation({
       // 停止时这里抛 AbortError：不记结果，runTurn 里的 sealHistory 会补一条「没执行」
       const result = await execute({ id, name, arguments: args }, signal);
       history.push({ role: "tool", tool_call_id: id, content: JSON.stringify(result) });
+      if (stopAfterTools?.()) own.abort();
       const now = goal();
       if (now === told) return result;
       told = now;
@@ -161,6 +162,7 @@ export async function runCliConversation({
   }
   // CLI 被停掉时手上的工具可能还没做完：等它做完、结果记进历史再收尾（不然它做完以后才往历史里补，顺序就乱了）
   await mcp.close();
+  if (stopAfterTools?.() && !signal?.aborted) return { text: joined(), toolCalls: calls };
   // 到了上限是我们自己叫停的，照常收尾；其余的把已经说出来的半句留在历史里
   const killed = own.signal.aborted && !signal?.aborted;
   if (failure && !killed) {

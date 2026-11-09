@@ -45,28 +45,15 @@ const turn = (overrides) => ({
 });
 
 describe("talking a local CLI through a turn", () => {
-  for (const runtime of ['codex', 'claude']) it(`${runtime}: automatically continues a failed review through a fresh CLI without a new user message`, async () => {
-    const { ai, records, setPlan } = await fakeAi({ steps: [{ call: 'get_timeline' }, { say: '已经完成' }] });
-    let corrected = false;
-    const history = [{ role: 'user', content: '原始剪辑要求' }], limits = [];
+  for (const runtime of ['codex', 'claude']) it(`${runtime}: stops at the review notice without launching a repair CLI`, async () => {
+    const { ai, records } = await fakeAi({ steps: [{ call: 'get_timeline' }, { say: '已经完成' }] });
     const result = await runReviewedConversation({
-      ...turn({ config: { runtime, model: '', videoInput: false }, history, localAi: ai }),
-      maxToolCalls: 5,
-      converse: args => { limits.push(args.maxToolCalls); return runCliConversation(args); },
-      reviewGate: { check: async () => corrected ? null : { fingerprint: 'failed-draft', prompt: '曲面未贴合，请修改并复核' } },
-      execute: async call => { if (call.name === 'add_text_clip') corrected = true; return { ok: true }; },
-      onContinue: async () => setPlan({ steps: [{ call: 'add_text_clip' }, { say: '修改并复核完成' }] }),
+      ...turn({ config: { runtime, model: '', videoInput: false }, history: [{ role: 'user', content: '剪一版' }], localAi: ai }),
+      maxToolCalls: 5, converse: runCliConversation,
+      reviewGate: { allow: () => null, observe: () => {}, check: async () => ({ notice: '字幕待确认' }) },
     });
-    expect(result).toEqual({ text: '修改并复核完成', toolCalls: 2 });
-    expect(limits).toEqual([5, 4]);
-    expect(history.filter(e => e.role === 'user')).toHaveLength(1);
-    const executions = await records();
-    expect(executions).toHaveLength(2);
-    const prompt = runtime === 'claude' ? JSON.parse(executions[1].stdin).message.content[0].text : executions[1].stdin;
-    expect(prompt).toContain('用户：原始剪辑要求');
-    expect(prompt).toContain('应用自主验收反馈，不是用户追加消息');
-    expect(prompt).toContain('曲面未贴合');
-    expect(prompt).not.toContain('【用户最新的消息】\n已经完成');
+    expect(result).toEqual({ text: '字幕待确认', toolCalls: 1 });
+    expect(await records()).toHaveLength(1);
   });
 
   it("parses a local runtime config without a key", () => {
